@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Signalscope · Timber Hearth</title>
+<link rel="stylesheet" href="{{ prefix }}/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔭</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <img class="logo" src="{{ prefix }}/static/chert.png" alt="Chert"><h1>Signalscope</h1>
+  <span class="subtitle muted">Timber Hearth · every claude on this box</span>
+  <span id="summary" class="muted"></span>
+  <span id="disk" class="disk" title="free space on the transcript disk"></span>
+</header>
+<main>
+  <div id="cards" class="cards"><div class="muted pad">scanning for signals…</div></div>
+  <details id="dead-wrap" class="dead-wrap" hidden>
+    <summary>🌌 signals lost — recently ended sessions</summary>
+    <div id="dead"></div>
+  </details>
+</main>
+<script>
+const PREFIX = {{ prefix|tojson }};
+</script>
+<script src="{{ prefix }}/static/index.js"></script>
+</body>
+</html>

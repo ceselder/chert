@@ -1,0 +1,17 @@
+[Unit]
+Description=chert: Discord bridge (one thread per live claude session)
+After=network-online.target chert-tmux.service
+Wants=network-online.target chert-tmux.service
+
+[Service]
+User=@USER@
+Group=@USER@
+WorkingDirectory=@APP@
+EnvironmentFile=@APP@/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@VENV@/bin/python discord_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

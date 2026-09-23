@@ -1,0 +1,15 @@
+[Unit]
+Description=chert: web dashboard (loopback; put nginx/basic-auth or dashboard_proxy.py in front)
+After=network-online.target
+
+[Service]
+User=@USER@
+Group=@USER@
+WorkingDirectory=@APP@
+EnvironmentFile=@APP@/.env
+ExecStart=@VENV@/bin/gunicorn --bind 127.0.0.1:8899 --workers 2 --threads 4 --timeout 60 app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

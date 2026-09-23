@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{ s.name }} — Signalscope</title>
+<link rel="stylesheet" href="{{ prefix }}/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔭</text></svg>">
+</head>
+<body class="session-body">
+<header class="topbar">
+  <a class="back" href="{{ prefix }}/">←</a>
+  <h1 class="session-title">{{ s.name }}</h1>
+  <span id="status-chip" class="chip {{ s.status }}">{{ s.status }}</span>
+</header>
+<div class="tabs">
+  <button id="tab-screen" class="tab active">Screen</button>
+  <button id="tab-chat" class="tab">Chat</button>
+</div>
+<main class="session-main">
+  <div id="pane-screen" class="pane">
+    {% if live and s.pane %}
+    <pre id="screen" class="screen">tuning in…</pre>
+    {% else %}
+    <div class="muted pad">No live terminal for this session{% if not live %} — its loop has ended{% endif %}.</div>
+    {% endif %}
+  </div>
+  <div id="pane-chat" class="pane" hidden>
+    <div id="chat" class="chat"></div>
+  </div>
+</main>
+{% if live and s.pane %}
+<footer class="composer">
+  <div class="quickkeys">
+    <button data-key="Escape">esc</button>
+    <button data-key="Up">↑</button>
+    <button data-key="Down">↓</button>
+    <button data-key="Tab">tab</button>
+    <button data-key="BTab">⇧tab</button>
+    <button data-key="Space">␣</button>
+    <button data-key="1">1</button>
+    <button data-key="2">2</button>
+    <button data-key="3">3</button>
+    <button data-key="4">4</button>
+    <button data-key="Enter">⏎</button>
+  </div>
+  <div class="inputrow">
+    <textarea id="msg" rows="1" placeholder="send a signal to this traveler…"></textarea>
+    <button id="send" class="sendbtn">send</button>
+  </div>
+</footer>
+{% endif %}
+<script>
+const PREFIX = {{ prefix|tojson }};
+const SID = {{ s.sid|tojson }};
+const LIVE = {{ (live and s.pane is not none)|tojson }};
+</script>
+<script src="{{ prefix }}/static/session.js"></script>
+</body>
+</html>

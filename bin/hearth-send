@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# hearth-send <file> [caption...] — post a file or image INLINE into this Claude session's
+# Discord thread (the chert bridge). The file stays on the box; its bytes are uploaded to the
+# thread you're talking in. Images render inline. Great for plots, reports, screenshots.
+#
+#   hearth-send results/accuracy.png "final sweep"
+#   hearth-send ~/shared/reports/foo/report.html
+#
+# The bridge finds your thread by the tmux pane you're running in (falling back to the working
+# directory). Run it from inside the session's shell (that's where your Bash tool calls run).
+set -euo pipefail
+[[ $# -ge 1 ]] || { echo "usage: hearth-send <file> [caption...]" >&2; exit 2; }
+path="$1"; shift; caption="${*:-}"
+[[ -f "$path" ]] || { echo "hearth-send: no such file: $path" >&2; exit 1; }
+
+port="${HEARTH_HOOK_PORT:-8897}"
+secret_file="${HEARTH_HOOK_SECRET:-$HOME/.claude/hearth-hook.secret}"
+secret=""; [[ -r "$secret_file" ]] && secret="$(tr -d '\n' < "$secret_file")"
+pane="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)}"
+
+payload="$(python3 -c 'import json,os,sys
+print(json.dumps({"path":os.path.abspath(sys.argv[1]),"caption":sys.argv[2],
+                  "pane":sys.argv[3],"cwd":os.getcwd()}))' "$path" "$caption" "$pane")"
+
+code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${port}/session-file" \
+  ${secret:+-H "X-Hearth-Secret: $secret"} -H 'content-type: application/json' -d "$payload" || true)"
+case "$code" in
+  202) echo "sent to Discord ($(basename "$path"))" ;;
+  404) echo "hearth-send: bridge says file not found (path must be readable by the bridge)" >&2; exit 1 ;;
+  403) echo "hearth-send: bad hook secret" >&2; exit 1 ;;
+  000|"") echo "hearth-send: bridge not reachable on 127.0.0.1:${port} (is claude-discord-bridge up?)" >&2; exit 1 ;;
+  *)   echo "hearth-send: bridge returned HTTP $code" >&2; exit 1 ;;
+esac

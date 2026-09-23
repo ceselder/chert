@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# model-check [substring] — show the ACTUAL model recent turns ran on, per live Claude Code
+# session, read from the transcripts. This reveals auto-mode classifier reroutes (e.g. a session
+# pinned to `fable` whose sensitive turns silently run on `opus-4-8`), which `/model` and
+# `/status` do NOT show — they report the *configured* model, not what each turn was routed to.
+#
+#   model-check              # every live session
+#   model-check nla          # only sessions whose name/project matches "nla"
+#   model-check --last 40    # look at the last 40 turns instead of 20
+set -euo pipefail
+N=20; FILTER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in --last) N="$2"; shift 2;; *) FILTER="$1"; shift;; esac
+done
+export MC_N="$N" MC_FILTER="$FILTER"
+python3 - <<'PY'
+import glob, json, os, re
+from collections import Counter
+N = int(os.environ.get("MC_N", "20")); FILT = os.environ.get("MC_FILTER", "").lower()
+proj = os.path.expanduser("~/.claude/projects")
+# map sessionId -> transcript path (newest wins)
+tx = {}
+for f in glob.glob(f"{proj}/*/*.jsonl"):
+    sid = os.path.basename(f)[:-6]
+    if sid not in tx or os.path.getmtime(f) > os.path.getmtime(tx[sid]):
+        tx[sid] = f
+rows = []
+for reg in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    try:
+        d = json.load(open(reg))
+    except Exception:
+        continue
+    sid = d.get("sessionId", ""); name = d.get("name") or "?"; cwd = d.get("cwd") or ""
+    if FILT and FILT not in name.lower() and FILT not in cwd.lower():
+        continue
+    path = tx.get(sid)
+    if not path:
+        continue
+    models = re.findall(r'"model":"([^"]*)"', open(path, encoding="utf-8", errors="replace").read())
+    if not models:
+        continue
+    base = Counter(models).most_common(1)[0][0]   # the session's usual model (mode), not first turn
+    recent = models[-N:]; cur = models[-1]
+    drops = sum(1 for m in models if m != base)
+    rows.append((name, cur, base, drops, len(models), Counter(recent)))
+if not rows:
+    print("no live sessions" + (f" matching '{FILT}'" if FILT else "")); raise SystemExit
+w = max(len(r[0]) for r in rows)
+for name, cur, base, drops, total, recent in sorted(rows):
+    tag = "" if cur == base else "  ⤵️ classifier reroute"
+    mix = ", ".join(f"{m.replace('claude-','')}×{c}" for m, c in recent.most_common())
+    print(f"{name:<{w}}  now={cur.replace('claude-','')}  baseline={base.replace('claude-','')}"
+          f"  reroutes={drops}/{total}{tag}")
+    print(f"{'':<{w}}  last {min(N,total)} turns: {mix}")
+PY

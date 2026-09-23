@@ -1,0 +1,14 @@
+.env
+.venv/
+bot_state.json
+__pycache__/
+.wstunnel-secret
+CLIENT-SETUP.txt
+bot_state.json.bak
+bot_state.json.tmp
+.claude/
+systemd/rendered/
+
+# box-specific notes and unit files (kept locally, never published)
+private/
+.env.bak*
