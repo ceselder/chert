@@ -1620,6 +1620,9 @@ class Bridge(discord.Client):
         self._rate_limits = {}             # session key -> deque of StopFailure timestamps
         self._hook_secret = None
         self._twin_wait = {}               # new key -> first seen, while its sid is still live elsewhere
+        self._titles = {}                  # thread id -> title it should have (see retitle)
+        self._retitling = set()
+        self._title_tasks = set()
         self.tree = discord.app_commands.CommandTree(self)
         self.register_commands()
 
@@ -1939,6 +1942,32 @@ class Bridge(discord.Client):
             return await self.fetch_channel(tid)
         except (discord.NotFound, discord.Forbidden):
             return None
+
+    def retitle(self, thread, title):
+        """Rename a thread without blocking the poll loop. Discord allows ~2 renames per
+        10 min per thread and discord.py sleeps out the 429 inside the call: once that was
+        113 s, the whole tick froze on a stale session list, and three sessions restarted
+        meanwhile were declared gone. Renames now run in the background; latest title wins."""
+        self._titles[thread.id] = title
+        if thread.id in self._retitling:
+            return
+
+        async def run():
+            done = None
+            try:
+                while self._titles.get(thread.id) != done:
+                    done = self._titles[thread.id]
+                    try:
+                        await thread.edit(name=done)
+                    except discord.HTTPException:
+                        break
+            finally:
+                self._retitling.discard(thread.id)
+
+        self._retitling.add(thread.id)
+        task = asyncio.create_task(run())   # keep a reference: the loop only holds weak ones
+        self._title_tasks.add(task)
+        task.add_done_callback(self._title_tasks.discard)
 
     async def unarchive(self, thread_id):
         """Discord auto-archives threads after 7 quiet days and then refuses posts
@@ -2260,10 +2289,7 @@ class Bridge(discord.Client):
             await self.edit_status(st, s)
             thread = await self.get_thread(st["thread"])
             if thread:
-                try:
-                    await thread.edit(name=title)
-                except discord.HTTPException:
-                    pass
+                self.retitle(thread, title)
                 if not backfill:
                     await thread.send(f"-# ✏️ renamed to **{s['name']}**", allowed_mentions=NO_PING)
             save_state()
@@ -3189,6 +3215,17 @@ class Bridge(discord.Client):
         if live and live["pane"]:
             await report(f"-# already live and steerable (pane `{live['pane']}`) — just type here")
             return live
+        if not live and not fork:
+            # never start a second claude on a conversation another process is already
+            # running: both would append to the same transcript
+            twin = next((s for s in await asyncio.to_thread(live_sessions) if s["sid"] == sid), None)
+            if twin:
+                where = (state.get(twin["key"]) or {}).get("thread")
+                await report(f"-# this conversation is already running (pid {twin['pid']}"
+                             + (f", pane `{twin['pane']}`" if twin["pane"] else "") + ")"
+                             + (f" — talk to it in <#{where}>" if where and where != st.get("thread") else "")
+                             + " · `!revive fork` opens a separate copy")
+                return None
         cwd = ((live or {}).get("cwd") or st.get("cwd")
                or await asyncio.to_thread(transcript_cwd, sid))
         if not cwd or not Path(cwd).is_dir():
