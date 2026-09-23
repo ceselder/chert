@@ -286,80 +286,27 @@ KEYMAP = {"esc": "Escape", "escape": "Escape", "enter": "Enter", "up": "Up",
           "down": "Down", "left": "Left", "right": "Right", "tab": "Tab",
           "shift-tab": "BTab", "space": "Space", "pgup": "PageUp", "pgdn": "PageDown",
           **{str(i): str(i) for i in range(1, 10)}}
-HELP = ("🔭 **chert's signalscope** — every claude on this box is a traveler with its own thread.\n"
-        "**`/claude <prompt>`** (or @mention me) in any channel → I launch a NEW claude and open "
-        "its thread. Optional first word = project dir, e.g.\n"
-        "> @chert oracle-lens why is the step-20 eval slow?\n"
-        "reply in a thread → typed into that claude's terminal (attachments are saved to "
-        "`~/shared/uploads` and the path is passed along)\n"
-        "📡 when a claude needs input, its prompt arrives as **buttons** — tap to answer\n"
-        "🔭 while it works, one **activity card** per turn is edited in place (what it's doing, "
-        "the command, its latest thought, tool tally, elapsed, **which model the turn ran on**) — "
-        "watch without being pinged\n"
-        "🧠 the card + status line show the **model in use**; a ⤵️ reroute alert fires the first "
-        "time the auto-mode classifier drops a turn to another model, and 🚧 when it blocks an action\n"
-        "🖼️ **plots appear inline automatically**: any image a claude opens with its Read tool is "
-        "mirrored into its thread (CLAUDE.md has it open every plot it makes). Other files "
-        "(report.html, PDFs, data) it posts with `hearth-send <file> [caption]`\n"
-        "`!screen` — current terminal screen · `!key esc` (or up/down/tab/shift-tab/space/1-9/enter)\n"
-        "`!mute` / `!unmute` — pause/resume this thread's updates · `!help` — this text\n"
-        "`!revive` — resume a background/ended/crashed session in tmux so you can talk to it "
-        "(`!revive fork` keeps the original running; `!revive force` stops a busy one)\n"
-        "`!fork [message]` (or `/fork`) — clone this session into a NEW claude with its own "
-        "thread (own tmux window, same history up to now, steerable right away) · "
-        "`!fork astra [message]` (or `/fork to:astra`) hands the whole conversation to a new "
-        "**GPT-6 Astra** session instead — it reads a rendered handoff of the transcript first; "
-        "the claude keeps running\n"
-        "**`!resume [words]`** in the main channel (or `/resume` with live autocomplete) — a "
-        "searchable list of **every session this box has ever had**, on disk or only in the S3 "
-        "backup; pick one to bring it up in a thread, or get the link if it's already up\n"
-        "🧭 **`let feldspar look into this`** (or `!feldspar [focus]`, `/feldspar`) in a session's "
-        "thread — two independent frontier reviewers (latest Claude @ max effort with many "
-        "subagents, plus OpenAI via codex) hunt for bugs, flaws and methodological errors and "
-        "write a report to `~/shared/reports/feldspar-…`; in the main channel name the project "
-        "first: `!feldspar <dir> [focus]`\n"
-        "🛰️ **`!astra [dir] <prompt>`** (or `/astra`; inside a claude's thread it takes that "
-        "project) — a **GPT-6 Astra session via codex** as its own thread: reply there to "
-        "continue it, `!effort ultra` (low…ultra), `!kill` ends it\n"
-        "`!kill` — end this claude + archive the thread (`!kill hard` kills its tmux "
-        "pane, `!kill delete` also deletes the thread)\n"
-        "🔐 **`!bypass`** — the auto-mode **classifier is blocking this claude? turn it off** for this "
-        "session (presses shift+tab through the permission modes until `bypass permissions` is on); "
-        "`!auto` turns it back on; `!mode plan|default` too (or `/mode`)\n"
-        "✏️ **`!rename <name>`** (or `/rename`) — rename this session: types Claude Code's own "
-        "`/rename` into it, so the session, its thread title and the board all update\n"
-        "🧑‍🔬 **`!effort <low|medium|high|xhigh|max>`** (or `/effort`) — set this claude's reasoning "
-        "effort (drives Claude Code's own `/effort`)\n"
-        "🧠 **`!model <name>`** (or `/model`, **owner only**) — switch this claude's model (fable, opus, "
-        "sonnet, haiku or a full id); busy → queued until idle · **`/globalmodel <name>`** (or "
-        "`!globalmodel`) switches **every** live claude and the default for new ones\n"
-        "🔄 **`!refresh [message]`** (or `/refresh`, `!unstick`) — **when a claude is stuck**: sends "
-        "Esc first (a hung turn or a stuck dialog usually frees), and only if it stays frozen does an "
-        "in-place restart with history intact; not live → revives it. Idle + recently active = not "
-        "stuck, so it just delivers your message (`!refresh force` restarts anyway)\n"
-        "`!restart` — clean exit + `claude -r` in the same pane with the same flags, thread kept "
-        "(picks up new settings/keys/hooks; refuses busy/shell unless `!restart force`) · main "
-        "channel: `!restart all [force]` rolls through every idle session\n"
-        "`!yolo 1h` — bypassPermissions for a window (`30m`, `90s`, `off`; max 12h). "
-        "Applies to claudes started during the window, not ones already running\n"
-        "🪐 `!log [n]` — this session's **ship log**: prompts, what Claude decided, tool bursts "
-        "(last 25 by default) · ☀️ `!supernova [22m] [stop|kill]` — a countdown for this "
-        "session: milestones edited in place, ping at T-2 min, and at zero it tells the claude "
-        "to wrap up (`stop` interrupts it first, `kill` ends it) · `!supernova off`\n"
-        "**`!threads`** (= `!sessions`, works in any channel) — every live claude as a "
-        "clickable thread link, since Discord hides threads once there are a lot\n"
-        "🧠 **#all-claudes** — ask **every claude at once**: a plain message there is fanned out to "
-        "all live claudes, their replies are collected (≤4 min) and handed to a persistent "
-        "**summarizer claude** (`all-claudes-hub`) whose synthesis lands back in the channel. Talk to "
-        "the summarizer alone by **replying** to its message or `!hub <msg>` (it can interrogate any "
-        "individual claude); `!all <msg>` there is a plain broadcast with no summary\n"
-        "main channel: `!all <msg>` broadcast to every claude · `!revive all` bring back "
-        "everything that died in the last reboot/crash · `!cleanup` archive every dead "
-        "thread (`!cleanup delete` to remove them)\n"
-        "🪐 **Ash Twin (S3)**: `!disk` free space + biggest cold dirs · `!offload <dir>` copy "
-        "to S3, verify, free the disk (`… confirm` to run) · `!restore <dir> confirm` · "
-        "`!backup` sync transcripts + config now · `!s3` what's in the bucket\n"
-        f"#claude-chat: two-way bridge to the claude↔claude bus · [dashboard]({DASHBOARD})")
+HELP = ("🔭 **chert** — every Claude Code session on this box has a thread in #claudes. "
+        "Write in a thread to type into that session; permission prompts arrive as buttons.\n"
+        "\n**In a session's thread**\n"
+        "`/refresh [message]` unstick it: Esc first, restart in place only if still stuck\n"
+        "`/screen` show the terminal · `/key <key>` press esc, enter, arrows, tab, 1–9\n"
+        "`/fork [message] [to]` copy it into a new session (`to: astra` hands it to GPT)\n"
+        "`/rename` · `/effort` · `/model` (owner) · `/mode` (`bypass` = classifier off)\n"
+        "`/restart [force]` restart in place · `/revive [mode]` bring back an ended session\n"
+        "`/log [count]` timeline · `/mute` · `/unmute` · `/supernova` countdown to wrap-up\n"
+        "`/kill [how]` end it · `/feldspar [focus]` Claude + GPT code review\n"
+        "\n**Anywhere**\n"
+        "`/claude <prompt>` start a session · `/resume <session>` bring back any past one\n"
+        "`/sessions` list live sessions · `/astra <prompt>` a GPT session as a thread\n"
+        "`/globalmodel` switch every session (owner) · `/yolo <30m|1h|off>` bypass for new sessions\n"
+        "\n**Fleet** (output goes to #claudes)\n"
+        "`/all <message>` send to every session · `/restartall` · `/reviveall` · `/cleanup`\n"
+        "`/disk` · `/backup` · `/offload <dir>` · `/restore <dir>` · `/s3` (S3 needs S3_BUCKET)\n"
+        "\n**#all-claudes**: a plain message asks every session and a summarizer answers; "
+        "reply to it or use `/hub` to follow up.\n"
+        "Every slash command also works as `!name` text (`!screen`, `!kill hard`, …). "
+        f"[dashboard]({DASHBOARD})")
 
 # Steering needs a tmux pane. Background sessions (registry `kind: bg`) run with no
 # controlling terminal at all, so `ps -o tty=` is "?" and there is nothing to paste into.
@@ -1513,6 +1460,26 @@ def codex_sandbox_broken(log, report):
             and "sandbox" in (report or "").lower() and len(report or "") < 4000)
 
 
+class _SlashMsg:
+    """Just enough of a discord.Message for the text-command handlers, so every slash command
+    runs exactly the same code as typing its `!` form in that channel. Reactions are no-ops:
+    the interaction's own (ephemeral) reply is the acknowledgement."""
+    def __init__(self, interaction, channel, content):
+        self.content = content
+        self.channel = channel
+        self.author = interaction.user
+        self.guild = interaction.guild
+        self.id = interaction.id
+        self.attachments, self.mentions = [], []
+        self.reference = self.webhook_id = None
+
+    async def add_reaction(self, emoji):
+        return None
+
+    async def reply(self, content=None, **kw):
+        return await self.channel.send(content, **kw)
+
+
 class _Owner:
     """Stand-in author for messages the bridge itself types into a session (they arrive
     verbatim, like the owner's, instead of prefixed with a name)."""
@@ -2025,6 +1992,11 @@ class Bridge(discord.Client):
         except discord.HTTPException:
             pass
         return thread
+
+    async def send_help(self, channel):
+        """HELP in ≤2000-char chunks (one oversized message used to fail silently)."""
+        for chunk in split_chunks(HELP):
+            await channel.send(chunk, suppress_embeds=True, allowed_mentions=NO_PING)
 
     async def say(self, channel, text, ping_owner=False):
         """Bot-voice message to a channel/thread, chunked. Returns the first message."""
@@ -3197,7 +3169,7 @@ class Bridge(discord.Client):
         the bundle to the summarizer hub, whose synthesis is mirrored back here."""
         content = (msg.content or "").strip()
         if content.lower() == "!help":
-            return await msg.channel.send(HELP, suppress_embeds=True, allowed_mentions=NO_PING)
+            return await self.send_help(msg.channel)
         attached = await self.save_attachments(msg)
         low = content.lower()
         plain = low.startswith("!all ")
@@ -3892,6 +3864,164 @@ class Bridge(discord.Client):
                     "run this inside a session's thread", ephemeral=True)
             await interaction.response.defer(thinking=True)
             await bridge.cycle_mode(key, state[key], followup(interaction), mode)
+        # ---- slash versions of the text commands: each runs the same handler as its `!` form ----
+        Choice = discord.app_commands.Choice
+
+        async def run_as_text(interaction, text, where):
+            """where = "thread" (a session or Astra thread only), "main" (#claudes),
+            "broadcast" (#all-claudes), or "here" (this session thread, else #claudes).
+            A thread-only command never runs anywhere else, so it can't fall through and be
+            typed into a session as plain text."""
+            in_session = interaction.channel_id in thread_to_key()
+            in_astra = str(interaction.channel_id) in state.get("_astra", {})
+            if where == "thread":
+                if not (in_session or in_astra):
+                    return await interaction.response.send_message(
+                        "run this inside a session's thread", ephemeral=True)
+                target = interaction.channel
+            elif where == "main":
+                target = bridge.main_channel
+            elif where == "broadcast":
+                target = bridge.broadcast_channel
+            else:
+                target = interaction.channel if in_session else bridge.main_channel
+            if target is None:
+                return await interaction.response.send_message("that channel isn't set up", ephemeral=True)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                await bridge.on_message(_SlashMsg(interaction, target, text))
+            except Exception as e:  # noqa: BLE001
+                log_error(f"slash {text.split()[0]}", e)
+                return await interaction.followup.send(f"⚠️ `{text}` failed: {e}", ephemeral=True)
+            there = "" if target.id == interaction.channel_id else f" → <#{target.id}>"
+            await interaction.followup.send(f"-# ran `{text}`{there}", ephemeral=True)
+
+        # in a session's thread
+        @tree.command(name="screen", description="Show this session's terminal screen")
+        async def screen_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!screen", "thread")
+
+        @tree.command(name="key", description="Press a key in this session's terminal")
+        @discord.app_commands.describe(key="the key to press")
+        @discord.app_commands.choices(key=[Choice(name=k, value=k) for k in (
+            "esc", "enter", "up", "down", "left", "right", "tab", "shift-tab", "space", "pgup", "pgdn",
+            "1", "2", "3", "4", "5", "6", "7", "8", "9")])
+        async def key_cmd(interaction: discord.Interaction, key: str):
+            await run_as_text(interaction, f"!key {key}", "thread")
+
+        @tree.command(name="restart", description="Restart this session in place, history kept (e.g. to pick up new settings)")
+        @discord.app_commands.describe(force="also restart it if it's busy or watching a shell job")
+        async def restart_cmd(interaction: discord.Interaction, force: bool = False):
+            await run_as_text(interaction, "!restart force" if force else "!restart", "thread")
+
+        @tree.command(name="revive", description="Bring back this thread's ended, crashed or background session")
+        @discord.app_commands.describe(mode="normal · force: also stop a busy copy · fork: keep the original running")
+        @discord.app_commands.choices(mode=[Choice(name="normal", value="normal"),
+                                            Choice(name="force", value="force"),
+                                            Choice(name="fork", value="fork")])
+        async def revive_cmd(interaction: discord.Interaction, mode: str = "normal"):
+            await run_as_text(interaction, "!revive" if mode == "normal" else f"!revive {mode}", "thread")
+
+        @tree.command(name="log", description="Timeline of this session's prompts, replies and tool runs")
+        @discord.app_commands.describe(count="how many entries (default 25)")
+        async def log_cmd(interaction: discord.Interaction,
+                          count: discord.app_commands.Range[int, 1, 200] = 25):
+            await run_as_text(interaction, f"!log {count}", "thread")
+
+        @tree.command(name="mute", description="Stop posting this session's updates in this thread")
+        async def mute_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!mute", "thread")
+
+        @tree.command(name="unmute", description="Resume posting this session's updates in this thread")
+        async def unmute_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!unmute", "thread")
+
+        @tree.command(name="kill", description="End this session and archive its thread")
+        @discord.app_commands.describe(how="end · hard: also kill its tmux pane · delete: also delete the thread")
+        @discord.app_commands.choices(how=[Choice(name="end", value="end"), Choice(name="hard", value="hard"),
+                                           Choice(name="delete", value="delete")])
+        async def kill_cmd(interaction: discord.Interaction, how: str = "end"):
+            await run_as_text(interaction, "!kill" if how == "end" else f"!kill {how}", "thread")
+
+        @tree.command(name="supernova", description="Countdown for this session; at zero it's told to wrap up and report")
+        @discord.app_commands.describe(minutes="length of the countdown (default 22)", then="what happens at zero",
+                                       cancel="cancel the running countdown instead")
+        @discord.app_commands.choices(then=[Choice(name="tell it to wrap up", value="wrap"),
+                                            Choice(name="interrupt its turn first", value="stop"),
+                                            Choice(name="end the session", value="kill")])
+        async def supernova_cmd(interaction: discord.Interaction,
+                                minutes: discord.app_commands.Range[int, 1, 720] = 22,
+                                then: str = "wrap", cancel: bool = False):
+            text = "!supernova off" if cancel else f"!supernova {minutes}m" + ("" if then == "wrap" else f" {then}")
+            await run_as_text(interaction, text, "thread")
+
+        # anywhere
+        @tree.command(name="yolo", description="bypassPermissions for sessions started in the next while, or off")
+        @discord.app_commands.default_permissions(administrator=True)
+        @discord.app_commands.describe(duration="e.g. 30m, 1h, 90s (max 12h), or off")
+        async def yolo_cmd(interaction: discord.Interaction, duration: str):
+            await run_as_text(interaction, f"!yolo {duration.strip()}", "here")
+
+        @tree.command(name="help", description="Everything chert can do")
+        async def help_cmd(interaction: discord.Interaction):
+            chunks = split_chunks(HELP)
+            await interaction.response.send_message(chunks[0], ephemeral=True, suppress_embeds=True)
+            for c in chunks[1:]:
+                await interaction.followup.send(c, ephemeral=True, suppress_embeds=True)
+
+        # fleet commands: always run in #claudes
+        @tree.command(name="all", description="Send a message to every live session")
+        @discord.app_commands.describe(message="what to send")
+        async def all_cmd(interaction: discord.Interaction, message: str):
+            await run_as_text(interaction, f"!all {message}", "main")
+
+        @tree.command(name="restartall", description="Restart every idle session in place, one at a time")
+        @discord.app_commands.default_permissions(administrator=True)
+        @discord.app_commands.describe(force="also restart busy sessions")
+        async def restartall_cmd(interaction: discord.Interaction, force: bool = False):
+            await run_as_text(interaction, "!restart all force" if force else "!restart all", "main")
+
+        @tree.command(name="reviveall", description="Bring back every session that died in a reboot or crash")
+        async def reviveall_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!revive all", "main")
+
+        @tree.command(name="cleanup", description="Archive the threads of ended sessions")
+        @discord.app_commands.default_permissions(administrator=True)
+        @discord.app_commands.describe(delete="delete them instead of archiving")
+        async def cleanup_cmd(interaction: discord.Interaction, delete: bool = False):
+            await run_as_text(interaction, "!cleanup delete" if delete else "!cleanup", "main")
+
+        @tree.command(name="disk", description="Free disk space and the largest directories nobody has touched lately")
+        async def disk_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!disk", "main")
+
+        @tree.command(name="backup", description="Back up transcripts and config to S3 now")
+        async def backup_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!backup", "main")
+
+        @tree.command(name="s3", description="What's in the S3 backup bucket")
+        async def s3_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!s3", "main")
+
+        @tree.command(name="offload", description="Move a directory to S3 and free the disk (shows the plan first)")
+        @discord.app_commands.default_permissions(administrator=True)
+        @discord.app_commands.describe(directory="directory to move (under your home)",
+                                       confirm="actually do it (without this you only get the plan)")
+        async def offload_cmd(interaction: discord.Interaction, directory: str, confirm: bool = False):
+            await run_as_text(interaction, f"!offload {directory.strip()}" + (" confirm" if confirm else ""), "main")
+
+        @tree.command(name="restore", description="Bring an offloaded directory back from S3")
+        @discord.app_commands.default_permissions(administrator=True)
+        @discord.app_commands.describe(directory="directory to restore", confirm="actually do it")
+        async def restore_cmd(interaction: discord.Interaction, directory: str, confirm: bool = False):
+            await run_as_text(interaction, f"!restore {directory.strip()}" + (" confirm" if confirm else ""), "main")
+
+        # #all-claudes
+        @tree.command(name="hub", description="Talk to the #all-claudes summarizer directly")
+        @discord.app_commands.describe(message="your follow-up")
+        async def hub_cmd(interaction: discord.Interaction, message: str):
+            await run_as_text(interaction, f"!hub {message}", "broadcast")
+
         async def model_autocomplete(interaction: discord.Interaction, current: str):
             cur = (current or "").lower()
             return [discord.app_commands.Choice(name=m, value=m)
@@ -4254,7 +4384,7 @@ class Bridge(discord.Client):
         content = (msg.content or "").strip()
         low = content.lower()
         if low == "!help":
-            return await msg.channel.send(HELP, suppress_embeds=True, allowed_mentions=NO_PING)
+            return await self.send_help(msg.channel)
         if low.startswith("!kill"):
             return await self.astra_kill(msg.channel, ent, delete=low.endswith("delete"))
         if low.startswith("!effort"):
@@ -4674,7 +4804,7 @@ class Bridge(discord.Client):
             except Exception as e:  # noqa: BLE001
                 await self.say(msg.channel, f"❌ `{e}`")
         elif low == "!help":
-            await msg.channel.send(HELP, suppress_embeds=True, allowed_mentions=NO_PING)
+            await self.send_help(msg.channel)
 
     async def on_message(self, msg):
         # Never process our OWN posts: everything the bridge streams out goes through a
@@ -4727,11 +4857,11 @@ class Bridge(discord.Client):
                 await self.retire_thread(msg.channel, "-# 🌌 untracked thread — archiving",
                                          delete=low.endswith("delete"))
             elif isinstance(msg.channel, discord.Thread) and low == "!help":
-                await msg.channel.send(HELP, suppress_embeds=True, allowed_mentions=NO_PING)
+                await self.send_help(msg.channel)
             return
         st = state[key]
         if low == "!help":
-            await msg.channel.send(HELP, suppress_embeds=True, allowed_mentions=NO_PING)
+            await self.send_help(msg.channel)
             return
         if low in ("!mute", "!unmute"):
             st["muted"] = low == "!mute"

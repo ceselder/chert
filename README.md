@@ -66,11 +66,19 @@ In a session's thread:
 | Command | What it does |
 |---|---|
 | `/refresh [message] [force]` | Unstick the session. Sends Esc first and restarts the session in place (history kept) only if it stays stuck. `message` is sent once it responds. If the session is idle and was active in the last five minutes, it isn't treated as stuck: only `message` is sent, unless `force` is set. |
+| `/screen` | Show the terminal screen. |
+| `/key <key>` | Press a key: `esc`, `enter`, arrow keys, `tab`, `shift-tab`, `space`, `pgup`, `pgdn`, `1`–`9`. |
 | `/fork [message] [to]` | Copy the session and its history into a new session with its own thread. With `to: astra`, the conversation goes to a GPT session instead. |
 | `/rename <name>` | Rename the session. The thread title follows. |
 | `/effort <level>` | Set reasoning effort: `low`, `medium`, `high`, `xhigh` or `max`. |
 | `/model <name>` | Switch the model: `fable`, `opus`, `sonnet`, `haiku` or a full model id. If the session is busy, the switch waits until it's idle. Owner only. |
 | `/mode <mode>` | Switch permission mode: `auto`, `bypass`, `plan` or `default`. In `auto` mode, a classifier can block actions; `bypass` turns it off for this session. |
+| `/restart [force]` | Restart the session in place (history kept), for example to pick up new settings. `force` also restarts it while it's busy. |
+| `/revive [mode]` | Bring back an ended, crashed or background session. `force` also stops a busy copy; `fork` keeps the original running. |
+| `/log [count]` | Show a timeline of prompts, replies and tool runs. |
+| `/mute`, `/unmute` | Stop or resume updates in this thread. |
+| `/supernova [minutes] [then] [cancel]` | Start a countdown (22 minutes by default). At zero the session is told to wrap up and report; `then` can interrupt its turn first or end the session. |
+| `/kill [how]` | End the session and archive the thread. `hard` also kills its tmux pane; `delete` also deletes the thread. |
 | `/feldspar [focus]` | Have two reviewers check this session's project. See [Feldspar](#feldspar). |
 
 Anywhere:
@@ -80,38 +88,32 @@ Anywhere:
 | `/claude <prompt> [project]` | Start a new session and open its thread. `project` is a directory under `PROJECT_ROOT`. |
 | `/resume <session>` | Search every session the machine has had (with autocomplete) and bring one back into a thread. |
 | `/sessions` | List live sessions with links to their threads. |
-| `/globalmodel <name>` | Switch every live session to a model, and make it the default for new ones. Owner only. |
 | `/astra <prompt> [project]` | Start a GPT session in its own thread. See [Astra](#astra). |
+| `/globalmodel <name>` | Switch every live session to a model, and make it the default for new ones. Owner only. |
+| `/yolo <duration>` | Start new sessions with permission checks off for a while (`30m`, `1h`, at most `12h`), or `off`. |
+| `/help` | List all commands. |
 
-`/model` and `/globalmodel` are limited to the owner (`DISCORD_OWNER_ID`, or the server owner),
-and Discord only shows them to admins by default.
-
-## Text commands
-
-These don't have slash commands yet. `!help` in any thread lists all of them.
-
-In a session's thread:
+For all sessions at once (the output is posted in `#claudes`):
 
 | Command | What it does |
 |---|---|
-| `!screen` | Show the terminal screen. |
-| `!key <key>` | Press a key: `esc`, `enter`, `up`, `down`, `tab`, `shift-tab`, `space`, `1`–`9`. |
-| `!restart [force]` | Restart the session in place, for example to pick up new settings. |
-| `!revive` | Bring back an ended or crashed session. |
-| `!log [n]` | Show a timeline of prompts, replies and tool runs. |
-| `!mute`, `!unmute` | Stop or resume updates in this thread. |
-| `!kill [hard\|delete]` | End the session and archive the thread. |
+| `/all <message>` | Send a message to every live session. |
+| `/restartall [force]` | Restart every idle session in place, one at a time. |
+| `/reviveall` | Bring back every session that died in a reboot or crash. |
+| `/cleanup [delete]` | Archive (or delete) the threads of ended sessions. |
+| `/disk` | Show free disk space and the largest directories that haven't been touched in a while. |
+| `/backup`, `/s3` | Back up transcripts and config to S3 now, or show what's in the bucket. Needs `S3_BUCKET`. |
+| `/offload <directory> [confirm]` | Copy a directory to S3, check every file, then delete the local copy. Without `confirm` it only shows the plan. Needs `S3_BUCKET`. |
+| `/restore <directory> [confirm]` | Bring an offloaded directory back from S3. |
 
-In `#claudes`:
+In `#all-claudes`, `/hub <message>` talks to the summarizer directly (see [Channels](#channels)).
 
-| Command | What it does |
-|---|---|
-| `!all <message>` | Send a message to every live session. |
-| `!restart all` | Restart every idle session, one at a time. |
-| `!revive all` | Bring back every session that died in a reboot or crash. |
-| `!cleanup [delete]` | Archive (or delete) the threads of ended sessions. |
-| `!disk` | Show free disk space and the largest directories that haven't been touched in a while. |
-| `!backup`, `!offload <dir>`, `!restore <dir>` | Back up transcripts to S3, or move a directory to S3 and back. Needs `S3_BUCKET`. |
+`/model` and `/globalmodel` only work for the owner (`DISCORD_OWNER_ID`, or the server owner).
+Discord shows `/model`, `/globalmodel`, `/yolo`, `/restartall`, `/cleanup`, `/offload` and
+`/restore` only to admins unless you change that in the server's integration settings.
+
+Every command also works as text in the same place: `!screen`, `!kill hard`, `!restart all`,
+and so on.
 
 ## Channels
 
@@ -122,7 +124,7 @@ status.
 live session receives it. chert collects their replies for up to four minutes, saves them to a
 file, and passes the file to a summarizer session called `all-claudes-hub`, whose answer appears
 in the channel. The summarizer stays running between questions and can follow up with individual
-sessions. To talk to the summarizer directly, reply to one of its messages. To send a message to
+sessions. To talk to the summarizer directly, reply to one of its messages or use `/hub`. To send a message to
 every session without a summary, start it with `!all`.
 
 **`#claude-chat`** mirrors a shared message file (`CHAT_LOG`) that sessions can append to if you
@@ -143,8 +145,8 @@ logged in with `codex login`.
 ## Astra
 
 `/astra <prompt>` opens a thread connected to a Codex session (`gpt-6-astra` by default). Each
-message you write in the thread is one turn. `!effort <level>` sets its reasoning effort and
-`!kill` ends it. In a Claude session's thread, `/fork to: astra` hands that conversation to a new
+message you write in the thread is one turn. `!effort <level>` sets its reasoning effort (up to
+`ultra`) and `/kill` ends it. In a Claude session's thread, `/fork to: astra` hands that conversation to a new
 Astra session.
 
 ## How it works
