@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 512 512" width="512" height="512">
+  <title>Chibi Chert, the Hearthian astronomer, drumming at dusk</title>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3f4396"/>
+      <stop offset="0.55" stop-color="#7d6cc2"/>
+      <stop offset="1" stop-color="#f3a27f"/>
+    </linearGradient>
+    <clipPath id="disc"><circle cx="256" cy="256" r="236"/></clipPath>
+
+    <ellipse id="head" cx="256" cy="210" rx="124" ry="116"/>
+    <clipPath id="headClip"><use xlink:href="#head"/></clipPath>
+    <rect id="visor" x="164" y="150" width="184" height="136" rx="64"/>
+    <clipPath id="visorClip"><use xlink:href="#visor"/></clipPath>
+    <ellipse id="body" cx="256" cy="372" rx="72" ry="62"/>
+    <clipPath id="bodyClip"><use xlink:href="#body"/></clipPath>
+    <path id="drum" d="M212 370 C 208 394, 212 412, 218 424 L 294 424 C 300 412, 304 394, 300 370 Z"/>
+    <clipPath id="drumClip"><use xlink:href="#drum"/></clipPath>
+    <path id="scarf" d="M178 318 Q 256 338, 334 318 L 339 337 Q 256 366, 173 337 Z"/>
+    <clipPath id="scarfClip"><use xlink:href="#scarf"/></clipPath>
+
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#342a63"/>
+      <stop offset="1" stop-color="#18132e"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ffe58f" stop-opacity="0.75"/>
+      <stop offset="0.55" stop-color="#ffb347" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ff9a2a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="eye" cx="0.42" cy="0.38" r="0.62">
+      <stop offset="0" stop-color="#fff8d2"/>
+      <stop offset="0.55" stop-color="#ffd65a"/>
+      <stop offset="1" stop-color="#f4a426"/>
+    </radialGradient>
+  </defs>
+
+  <!-- sticker disc -->
+  <circle cx="256" cy="256" r="248" fill="#ffffff"/>
+  <circle cx="256" cy="256" r="236" fill="url(#sky)"/>
+  <g clip-path="url(#disc)">
+    <g fill="#fff4c4">
+      <path d="M104 122 l4 11 11 4 -11 4 -4 11 -4 -11 -11 -4 11 -4z"/>
+      <path d="M156 70 l3 8 8 3 -8 3 -3 8 -3 -8 -8 -3 8 -3z"/>
+      <path d="M424 236 l3 8 8 3 -8 3 -3 8 -3 -8 -8 -3 8 -3z"/>
+      <path d="M70 232 l2.5 6 6 2.5 -6 2.5 -2.5 6 -2.5 -6 -6 -2.5 6 -2.5z"/>
+    </g>
+    <g fill="#ffffff">
+      <circle cx="200" cy="44" r="1.8" opacity=".8"/><circle cx="318" cy="52" r="1.6" opacity=".7"/>
+      <circle cx="120" cy="186" r="1.8" opacity=".7"/><circle cx="446" cy="176" r="1.6" opacity=".6"/>
+      <circle cx="370" cy="64" r="1.3" opacity=".6"/><circle cx="60" cy="170" r="1.4" opacity=".5"/>
+      <circle cx="470" cy="280" r="1.4" opacity=".45"/><circle cx="86" cy="300" r="1.3" opacity=".4"/>
+    </g>
+    <!-- pastel ringed planet -->
+    <g transform="translate(404 116) rotate(-20)" stroke-linecap="round">
+      <ellipse rx="40" ry="10" fill="none" stroke="#3b2418" stroke-width="8"/>
+      <ellipse rx="40" ry="10" fill="none" stroke="#ffe6a6" stroke-width="4"/>
+      <circle r="21" fill="#f6a9c4" stroke="#3b2418" stroke-width="4"/>
+      <path d="M-12 -9 a 14 14 0 0 1 13 -7" stroke="#ffe0ec" stroke-width="4" fill="none"/>
+      <path d="M-40 0 A40 10 0 0 0 40 0" fill="none" stroke="#3b2418" stroke-width="8"/>
+      <path d="M-40 0 A40 10 0 0 0 40 0" fill="none" stroke="#ffe6a6" stroke-width="4"/>
+    </g>
+    <!-- little planetoid ground -->
+    <path d="M16 410 C 150 380, 362 380, 496 410 L 496 520 L 16 520 Z" fill="#e27b55"/>
+    <path d="M40 404 C 160 383, 352 383, 472 404 C 352 394, 160 394, 40 404 Z" fill="#f7a57a"/>
+    <path d="M16 458 C 160 444, 352 444, 496 458 L 496 520 L 16 520 Z" fill="#cf6644"/>
+    <ellipse cx="256" cy="438" rx="118" ry="12" fill="#b8583a" opacity=".5"/>
+  </g>
+
+  <!-- ===== chibi Chert ===== -->
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <!-- feet peeking out -->
+    <ellipse cx="210" cy="430" rx="28" ry="17" fill="#5b4f66" stroke="#3b2418" stroke-width="5"/>
+    <ellipse cx="302" cy="430" rx="28" ry="17" fill="#5b4f66" stroke="#3b2418" stroke-width="5"/>
+    <path d="M194 424 q 12 -6 24 -3" stroke="#7d7189" stroke-width="3.5" fill="none"/>
+    <path d="M288 421 q 12 -3 24 3" stroke="#7d7189" stroke-width="3.5" fill="none"/>
+
+    <!-- round little body -->
+    <use xlink:href="#body" fill="#f7eedc"/>
+    <g clip-path="url(#bodyClip)">
+      <ellipse cx="292" cy="394" rx="70" ry="62" fill="#e7d7b6"/>
+      <path d="M196 330 L 212 320 L 330 404 L 314 414 Z" fill="#a0673a"/>
+    </g>
+    <use xlink:href="#body" fill="none" stroke="#3b2418" stroke-width="5"/>
+    <circle cx="222" cy="352" r="8" fill="#ff9a55" stroke="#3b2418" stroke-width="3.5"/>
+
+    <!-- drum -->
+    <use xlink:href="#drum" fill="#d98a4e"/>
+    <g clip-path="url(#drumClip)">
+      <path d="M270 360 C 282 386, 284 410, 278 430 L 310 430 L 310 360 Z" fill="#b86a34"/>
+      <path d="M210 388 C 236 396, 276 396, 302 388" stroke="#ffe2a8" stroke-width="6" fill="none"/>
+      <path d="M214 410 C 238 417, 274 417, 298 410" stroke="#ffe2a8" stroke-width="6" fill="none"/>
+      <path d="M218 374 L 227 388 L 237 375 L 247 390 L 256 376 L 265 390 L 275 375 L 285 388 L 294 374"
+            stroke="#fff6e0" stroke-width="2.5" fill="none"/>
+    </g>
+    <use xlink:href="#drum" fill="none" stroke="#3b2418" stroke-width="5"/>
+    <ellipse cx="256" cy="370" rx="44" ry="12" fill="#fff3d6" stroke="#3b2418" stroke-width="5"/>
+    <path d="M226 367 q 18 -5 38 -3" stroke="#ffffff" stroke-width="3.5" fill="none"/>
+
+    <!-- arms: one mitt on the drum, one up mid-beat -->
+    <path d="M202 336 Q 188 364 224 368" stroke="#3b2418" stroke-width="30" fill="none"/>
+    <path d="M202 336 Q 188 364 224 368" stroke="#f7eedc" stroke-width="20" fill="none"/>
+    <circle cx="229" cy="366" r="13" fill="#5b4f66" stroke="#3b2418" stroke-width="4.5"/>
+    <path d="M312 338 Q 344 340 352 318" stroke="#3b2418" stroke-width="30" fill="none"/>
+    <path d="M312 338 Q 344 340 352 318" stroke="#f7eedc" stroke-width="20" fill="none"/>
+    <circle cx="353" cy="314" r="13" fill="#5b4f66" stroke="#3b2418" stroke-width="4.5"/>
+    <path d="M372 300 q 10 12 4 26" stroke="#fff4c4" stroke-width="4" fill="none"/>
+    <path d="M384 290 q 14 16 6 36" stroke="#fff4c4" stroke-width="3.5" fill="none" opacity=".6"/>
+
+    <!-- teal bandana over the shoulders -->
+    <use xlink:href="#scarf" fill="#3fbfb5"/>
+    <g clip-path="url(#scarfClip)">
+      <path d="M160 342 Q 256 372, 352 342 L 352 380 L 160 380 Z" fill="#2e9e96"/>
+      <g fill="#e2fbf7"><circle cx="200" cy="336" r="2.6"/><circle cx="234" cy="344" r="2.2"/>
+        <circle cx="278" cy="344" r="2.6"/><circle cx="312" cy="334" r="2.2"/></g>
+    </g>
+    <use xlink:href="#scarf" fill="none" stroke="#3b2418" stroke-width="4.5"/>
+    <path d="M182 330 Q 150 332 140 352 Q 162 354 178 342 Z" fill="#3fbfb5" stroke="#3b2418" stroke-width="4"/>
+    <path d="M182 338 Q 160 356 164 380 Q 178 368 188 346 Z" fill="#36aea5" stroke="#3b2418" stroke-width="4"/>
+    <circle cx="182" cy="334" r="8" fill="#2e9e96" stroke="#3b2418" stroke-width="4"/>
+
+    <!-- big round helmet -->
+    <use xlink:href="#head" fill="#d9a036"/>
+    <g clip-path="url(#headClip)">
+      <ellipse cx="240" cy="194" rx="118" ry="106" fill="#f4c654"/>
+      <ellipse cx="196" cy="138" rx="34" ry="15" fill="#fff6d8" transform="rotate(-35 196 138)"/>
+      <circle cx="236" cy="114" r="6" fill="#fff6d8"/>
+    </g>
+    <use xlink:href="#head" fill="none" stroke="#3b2418" stroke-width="5"/>
+    <!-- side knobs -->
+    <circle cx="133" cy="226" r="17" fill="#cdd3dc" stroke="#3b2418" stroke-width="4.5"/>
+    <circle cx="133" cy="226" r="7" fill="#9ea7b6"/>
+    <circle cx="379" cy="226" r="17" fill="#cdd3dc" stroke="#3b2418" stroke-width="4.5"/>
+    <circle cx="379" cy="226" r="7" fill="#9ea7b6"/>
+
+    <!-- glossy visor, four sparkly eyes, blush, a small smile -->
+    <use xlink:href="#visor" fill="url(#glass)"/>
+    <g clip-path="url(#visorClip)">
+      <circle cx="216" cy="214" r="44" fill="url(#halo)"/>
+      <circle cx="296" cy="214" r="44" fill="url(#halo)"/>
+      <ellipse cx="189" cy="254" rx="17" ry="9" fill="#ff8db0" opacity=".55"/>
+      <ellipse cx="323" cy="254" rx="17" ry="9" fill="#ff8db0" opacity=".55"/>
+      <circle cx="216" cy="214" r="23" fill="url(#eye)"/>
+      <circle cx="296" cy="214" r="23" fill="url(#eye)"/>
+      <circle cx="208" cy="205" r="8.5" fill="#ffffff"/>
+      <circle cx="288" cy="205" r="8.5" fill="#ffffff"/>
+      <circle cx="224" cy="224" r="3.5" fill="#ffffff"/>
+      <circle cx="304" cy="224" r="3.5" fill="#ffffff"/>
+      <circle cx="232" cy="258" r="7.5" fill="#ffd65a"/>
+      <circle cx="280" cy="258" r="7.5" fill="#ffd65a"/>
+      <circle cx="230" cy="255" r="2.4" fill="#ffffff"/>
+      <circle cx="278" cy="255" r="2.4" fill="#ffffff"/>
+      <path d="M248 270 Q 256 278 264 270" stroke="#ffd65a" stroke-width="3.5" fill="none"/>
+      <path d="M186 198 C 188 176, 206 162, 232 160" stroke="#ffffff" stroke-width="7" fill="none" opacity=".3"/>
+      <circle cx="182" cy="216" r="4" fill="#ffffff" opacity=".3"/>
+    </g>
+    <use xlink:href="#visor" fill="none" stroke="#3b2418" stroke-width="12"/>
+    <use xlink:href="#visor" fill="none" stroke="#c99432" stroke-width="6"/>
+
+    <!-- music notes -->
+    <g transform="translate(400 300) rotate(-10)" stroke="#3b2418" stroke-width="3">
+      <ellipse rx="8" ry="6.2" fill="#ffe38a" transform="rotate(-20)"/>
+      <path d="M6.5 -2 L 6.5 -30 Q 18 -26 18 -15" fill="none" stroke-width="4.5"/>
+      <path d="M6.5 -2 L 6.5 -30 Q 18 -26 18 -15" fill="none" stroke="#ffe38a" stroke-width="1.8"/>
+    </g>
+    <g transform="translate(424 258) rotate(8)" stroke="#3b2418" stroke-width="3">
+      <ellipse rx="6.5" ry="5" fill="#fff2b3" transform="rotate(-20)"/>
+      <ellipse cx="20" cy="-5" rx="6.5" ry="5" fill="#fff2b3" transform="rotate(-20 20 -5)"/>
+      <path d="M5.5 -2 L 5.5 -26 L 25.5 -31 L 25.5 -7" fill="none" stroke-width="4.5"/>
+      <path d="M5.5 -2 L 5.5 -26 L 25.5 -31 L 25.5 -7" fill="none" stroke="#fff2b3" stroke-width="1.8"/>
+    </g>
+  </g>
+</svg>
