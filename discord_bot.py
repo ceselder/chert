@@ -48,6 +48,7 @@ import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -786,6 +787,21 @@ def render_tools(counts):
 CLASSIFIER_PHRASE = "denied by the Claude Code auto mode classifier"   # tool_result block text
 FILE_LIMIT_BYTES = int(os.environ.get("HEARTH_FILE_LIMIT", str(25 * 1024 * 1024)))  # Discord upload cap
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")   # images a claude Reads get mirrored to its thread
+# Discord shrinks an image preview to the chat width (~1000 px on a phone). A figure wider than
+# this aspect ratio (e.g. a 1×5 panel strip) ends up with a few-pixel-tall text, i.e. "blurry".
+WIDE_ASPECT = 2.2
+
+
+def png_size(path):
+    """(width, height) from a PNG header, or None (not a PNG / unreadable)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+    except OSError:
+        return None
+    if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) == 24:
+        return struct.unpack(">II", head[16:24])
+    return None
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")   # Claude Code /effort levels
 MODEL_RE = re.compile(r"^[A-Za-z0-9._\-\[\]]{2,60}$")        # alias (fable/opus/...) or full id; no spaces
 MODEL_SUGGESTIONS = ("fable", "opus", "sonnet", "haiku", "default", "claude-opus-5-5",
@@ -2335,7 +2351,12 @@ class Bridge(discord.Client):
                 seen.append(key)
                 continue
             try:
-                await thread.send(content=f"-# 🖼️ `{os.path.basename(p)}`",
+                note = ""
+                wh = png_size(p)
+                if wh and wh[1] and wh[0] / wh[1] >= WIDE_ASPECT:
+                    note = (f" · wide figure ({wh[0]}×{wh[1]}): Discord shrinks it to the chat width, "
+                            "so tap it and open the original to read it")
+                await thread.send(content=f"-# 🖼️ `{os.path.basename(p)}`{note}",
                                   file=await asyncio.to_thread(discord.File, p),
                                   allowed_mentions=NO_PING)
                 seen.append(key)
