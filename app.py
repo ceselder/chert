@@ -90,13 +90,37 @@ def proc_start(pid):
         return None
 
 
+_REGISTRY_LAST_GOOD = {}
+
+
+def _read_registry(f):
+    """One registry file, tolerant of being read mid-rewrite. Claude Code rewrites these on
+    every status change; a half-written read used to make a live session vanish for a single
+    poll, which the Discord bridge took as 'ended' (archived its thread, then opened a twin).
+    Retry briefly, then fall back to the last good parse. A missing file (OSError) is a real
+    end and returns None."""
+    for _ in range(3):
+        try:
+            d = json.loads(f.read_text())
+        except json.JSONDecodeError:
+            time.sleep(0.05)
+            continue
+        except OSError:
+            return None
+        _REGISTRY_LAST_GOOD[f.name] = d
+        return d
+    return _REGISTRY_LAST_GOOD.get(f.name)
+
+
 def live_sessions():
     """All registered claude sessions whose pid is alive, enriched with tmux pane info."""
     entries = []
-    for f in sorted(SESSIONS_DIR.glob("*.json")):
-        try:
-            d = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
+    files = sorted(SESSIONS_DIR.glob("*.json"))
+    for gone in set(_REGISTRY_LAST_GOOD) - {f.name for f in files}:
+        _REGISTRY_LAST_GOOD.pop(gone, None)
+    for f in files:
+        d = _read_registry(f)
+        if not d:
             continue
         pid = d.get("pid")
         if not pid or not Path(f"/proc/{pid}").exists():

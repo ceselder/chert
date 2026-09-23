@@ -792,6 +792,21 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")   # images a claude Read
 WIDE_ASPECT = 2.2
 
 
+TWIN_GRACE = 20   # seconds a new process waits while another live process holds its conversation
+
+
+def key_process_alive(key):
+    """Is the process behind a `pid:procStart` key still running (and not a recycled pid)?
+    Used before declaring a session gone: dropping out of one registry read is not an exit."""
+    pid, _, start = str(key).partition(":")
+    if not pid.isdigit():
+        return False
+    if proc_state(int(pid)) in (None, "Z"):
+        return False
+    ps = checkin.proc_start(int(pid))
+    return not (start and ps and str(ps) != start)
+
+
 def png_size(path):
     """(width, height) from a PNG header, or None (not a PNG / unreadable)."""
     try:
@@ -1604,6 +1619,7 @@ class Bridge(discord.Client):
         self._subs_pending = set()         # session keys with a subagent line render scheduled
         self._rate_limits = {}             # session key -> deque of StopFailure timestamps
         self._hook_secret = None
+        self._twin_wait = {}               # new key -> first seen, while its sid is still live elsewhere
         self.tree = discord.app_commands.CommandTree(self)
         self.register_commands()
 
@@ -2142,22 +2158,34 @@ class Bridge(discord.Client):
             st = state.get(key)
             if st is not None and (st.get("pending") or st.get("restarting")):
                 continue  # a summon/restart is mid-flight and owns this session's thread
+            if st is not None and st.get("ended") and st.get("thread"):
+                # This exact process is live again although we recorded it as ended: it only
+                # dropped out of one registry read. Keep its thread; never open a twin over it.
+                if await self.reopen_thread(key, s, st):
+                    continue
             if st is None or st.get("ended"):
-                # A NEW process carrying a conversation we already have a thread for — someone
-                # typed `claude -r <sid>` in the pane, or a fork/restart whose entry we lost.
-                # Continue in that thread instead of opening a twin. Only an entry whose own
-                # process is NOT live may be taken over (two live claudes can share a sid
-                # right after a fork; each keeps its own thread).
+                # A NEW process carrying a conversation we already have a thread for — `claude -r`
+                # in the pane, a /refresh or /restart, or a fork/restart whose entry we lost.
+                # Continue in that thread instead of opening a twin.
                 if st is None and s.get("sid"):
-                    old_key, old = next(((k, v) for k, v in sessions_state().items()
-                                         if v.get("sid") == s["sid"] and v.get("thread")
-                                         and k != key and k not in sessions), (None, None))
+                    same = [(k, v) for k, v in sessions_state().items()
+                            if v.get("sid") == s["sid"] and v.get("thread") and k != key]
+                    old_key, old = next(((k, v) for k, v in same if k not in sessions), (None, None))
+                    if not old and any(k in sessions for k, _ in same):
+                        # the old process is still shutting down (restarts overlap by a few
+                        # seconds): wait for it rather than treat this as a second live copy.
+                        # Two genuinely live copies of one conversation get their own thread
+                        # after TWIN_GRACE seconds.
+                        first = self._twin_wait.setdefault(key, time.time())
+                        if time.time() - first < TWIN_GRACE:
+                            continue
                     if old:
-                        state[key] = {**old, "ended": False, "ended_reason": None, "status": s["status"],
-                                      "name": s["name"], "cwd": s["cwd"] or old.get("cwd"),
+                        self._twin_wait.pop(key, None)
+                        state[key] = {**old, "ended": False, "ended_at": None, "ended_reason": None,
+                                      "status": s["status"], "name": s["name"], "cwd": s["cwd"] or old.get("cwd"),
                                       "size": os.path.getsize(s["transcript"]) if s["transcript"] else 0,
                                       "tool_msg": None, "tool_run": None, "prompt_msg": None, "card": None,
-                                      "thread_missing": 0}
+                                      "thread_missing": 0, "thread_name": None}
                         state[key].pop("restarting", None)
                         state.pop(old_key, None)
                         save_state()
@@ -2180,6 +2208,7 @@ class Bridge(discord.Client):
                 if not s.get("pane") and time.time() * 1000 - (s.get("started_at") or 0) < 20000:
                     continue
                 created += 1
+                self._twin_wait.pop(key, None)
                 try:
                     await self.open_thread(channel, s, key)
                 except Exception as e:  # noqa: BLE001
@@ -2189,10 +2218,11 @@ class Bridge(discord.Client):
                 await self.tick_session(channel, key, s, st)
             except Exception as e:  # noqa: BLE001 — one broken session must not stall the rest
                 log_error(f"session {key}", e)
-        # sessions that went away
+        # sessions that went away — but only if the process really is gone: a session that
+        # merely dropped out of one registry read must not be ended (and its thread archived)
         gone = [(k, st) for k, st in sessions_state().items()
                 if k not in sessions and not st.get("ended") and not st.get("pending")
-                and not st.get("restarting")]
+                and not st.get("restarting") and not key_process_alive(k)]
         if gone:
             phantoms = await asyncio.to_thread(checkin.phantom_keys)
             for key, st in gone:
@@ -2617,14 +2647,59 @@ class Bridge(discord.Client):
                            f"({names}). `!revive all` here brings them all back, or `!revive` in a thread.",
                            ping_owner=True)
 
+    async def reopen_thread(self, key, s, st):
+        """A tracked session recorded as ended is live again under the same key: it dropped out
+        of one registry read, or its entry was ended by mistake. Un-end it and keep its thread
+        (unarchive, retitle on the next tick). Returns False if the thread is gone."""
+        thread = await self.get_thread(st.get("thread"))
+        if not thread:
+            return False
+        st.update({"ended": False, "ended_at": None, "ended_reason": None, "status": s["status"],
+                   "name": s["name"], "sid": s["sid"], "cwd": s["cwd"] or st.get("cwd"),
+                   "thread_name": None, "card": None, "prompt_msg": None,
+                   "tool_msg": None, "tool_run": None, "thread_missing": 0})
+        twin = st.pop("retire_thread", None)
+        save_state()
+        try:
+            if getattr(thread, "archived", False):
+                await thread.edit(archived=False)
+            await thread.send("-# ♻️ reconnected — this session is live, continuing here",
+                              allowed_mentions=NO_PING)
+        except discord.HTTPException as e:
+            log_error("reopen_thread", e)
+        if twin and twin != thread.id:
+            tw = await self.get_thread(twin)
+            if tw:
+                try:
+                    await tw.send(f"-# this was a duplicate thread — the session continues in <#{thread.id}>",
+                                  allowed_mentions=NO_PING)
+                    await tw.edit(name=ended_title(tw.name), archived=True)
+                except discord.HTTPException as e:
+                    log_error("retire twin", e)
+        print(f"reopen: {s['name']} ({key}) back in thread {thread.id}"
+              + (f", retired twin {twin}" if twin else ""), flush=True)
+        return True
+
     async def open_thread(self, channel, s, key):
         name = s["name"]
+        cur = state.get(key)
+        if cur and cur.get("thread") and not cur.get("ended"):
+            return                        # something else already gave this session a thread
         collides = any(v.get("name") == name and not v.get("ended")
                        for v in sessions_state().values())
         title = thread_title(name, s["sid"], collides)
         thread = await channel.create_thread(
             name=title, type=discord.ChannelType.public_thread,
             auto_archive_duration=10080)
+        cur = state.get(key)
+        if cur and cur.get("thread") and cur["thread"] != thread.id and not cur.get("ended"):
+            # a restart/revive claimed this session while the thread was being created: keep
+            # its (original) thread and drop the duplicate we just made
+            try:
+                await thread.delete()
+            except discord.HTTPException:
+                pass
+            return
         size = os.path.getsize(s["transcript"]) if s["transcript"] else 0
         # record the thread FIRST: if the intro fails, the next tick must not open a twin
         state[key] = {"thread": thread.id, "parent": channel.id, "status_msg": None,
