@@ -292,14 +292,14 @@ HELP = ("🔭 **chert** — every Claude Code session on this box has a thread i
         "`/refresh [message]` unstick it: Esc first, restart in place only if still stuck\n"
         "`/screen` show the terminal · `/key <key>` press esc, enter, arrows, tab, 1–9\n"
         "`/fork [message] [to]` copy it into a new session (`to: astra` hands it to GPT)\n"
-        "`/rename` · `/effort` · `/model` (owner) · `/mode` (`bypass` = classifier off)\n"
+        "`/rename` · `/effort` · `/model` (owner) · `/fast [on|off]` (owner) · `/mode` (`bypass` = classifier off)\n"
         "`/restart [force]` restart in place · `/revive [mode]` bring back an ended session\n"
         "`/log [count]` timeline · `/mute` · `/unmute` · `/supernova` countdown to wrap-up\n"
         "`/kill [how]` end it · `/feldspar [focus]` Claude + GPT code review\n"
         "\n**Anywhere**\n"
         "`/claude <prompt>` start a session · `/resume <session>` bring back any past one\n"
         "`/sessions` list live sessions · `/astra <prompt>` a GPT session as a thread\n"
-        "`/globalmodel` switch every session (owner) · `/yolo <30m|1h|off>` bypass for new sessions\n"
+        "`/globalmodel` · `/fast on everywhere` every session (owner) · `/yolo <30m|1h|off>` bypass for new sessions\n"
         "\n**Fleet** (output goes to #claudes)\n"
         "`/all <message>` send to every session · `/restartall` · `/reviveall` · `/cleanup`\n"
         "`/disk` · `/backup` · `/offload <dir>` · `/restore <dir>` · `/s3` (S3 needs S3_BUCKET)\n"
@@ -560,17 +560,33 @@ def parse_duration(text):
     return int(float(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2) or "m"])
 
 
-def set_default_model(name):
-    """Set the top-level "model" in user settings (the default every new or restarted claude
-    starts on — it overrides the per-user default that Claude Code's own /model saves).
-    Atomic like set_default_mode. Returns the previous value."""
+def set_user_setting(key, value):
+    """Set one top-level key in ~/.claude/settings.json, atomically (temp file + rename, like
+    set_default_mode). Returns the previous value."""
     d = json.loads(USER_SETTINGS.read_text()) if USER_SETTINGS.exists() else {}
-    prev = d.get("model")
-    d["model"] = name
+    prev = d.get(key)
+    d[key] = value
     tmp = USER_SETTINGS.with_name(USER_SETTINGS.name + ".tmp")
     tmp.write_text(json.dumps(d, indent=2) + "\n")
     tmp.replace(USER_SETTINGS)
     return prev
+
+
+def set_default_model(name):
+    """The top-level "model" every new or restarted claude starts on (it overrides the
+    per-user default that Claude Code's own /model saves)."""
+    return set_user_setting("model", name)
+
+
+FAST_RESULT_RE = re.compile(r"(Kept Fast mode (?:ON|OFF)|Fast mode (?:ON|OFF)|"
+                            r"Fast mode (?:disabled|unavailable)[^\n│]*)")
+
+
+def fast_result(pane):
+    """What Claude Code last said about fast mode on a pane's screen, e.g. 'Fast mode ON' or
+    'Fast mode disabled · usage credits not available for your plan'; '' if nothing yet."""
+    hits = FAST_RESULT_RE.findall(screen_text(pane, 1600) or "")
+    return " ".join(hits[-1].replace("\\xB7", "·").split()) if hits else ""
 
 
 def set_default_mode(mode):
@@ -2206,15 +2222,18 @@ class Bridge(discord.Client):
                     await thread.send(f"-# ✏️ renamed to **{s['name']}**", allowed_mentions=NO_PING)
             save_state()
         st["cwd"] = s["cwd"] or st.get("cwd")
-        # a /model or /globalmodel that was queued because the claude was busy or prompting
-        if st.get("pending_model") and s.get("pane") and s["status"] not in ("busy", "waiting"):
-            name = st.pop("pending_model")
-            ok, _ = await self.type_slash(s, f"/model {name}")
-            save_state()
-            thread = await self.get_thread(st.get("thread"))
-            if thread:
-                await self.say(thread, f"-# 🧠 applied the queued `/model {name}`" if ok
-                               else f"-# ⚠️ couldn't apply the queued `/model {name}`")
+        # a /model or /fast that was queued because the claude was busy or showing a prompt
+        # (/fast is an "immediate" command in Claude Code, so it only waits out prompts)
+        for pk, cmd, blocked in (("pending_model", "/model", ("busy", "waiting")),
+                                 ("pending_fast", "/fast", ("waiting",))):
+            if st.get(pk) and s.get("pane") and s["status"] not in blocked:
+                val = st.pop(pk)
+                ok, _ = await self.type_slash(s, f"{cmd} {val}")
+                save_state()
+                thread = await self.get_thread(st.get("thread"))
+                if thread:
+                    await self.say(thread, f"-# applied the queued `{cmd} {val}`" if ok
+                                   else f"-# ⚠️ couldn't apply the queued `{cmd} {val}`")
         if st.get("muted"):
             st["status"] = s["status"]
             return
@@ -3477,6 +3496,80 @@ class Bridge(discord.Client):
         await respond("\n".join(lines)[:1900])
         self.log_event(f"🧠 global model → {name}: {len(now)} now, {len(queued)} queued")
 
+    async def set_fast(self, key, st, user, respond, mode):
+        """`/fast [on|off]` / `!fast` (owner only — fast mode draws from usage credits): type
+        Claude Code's own `/fast on|off` into this session, then report what Claude Code
+        answered on screen. /fast is an immediate command, so a busy session gets it right
+        away; one showing a prompt gets it once the prompt is answered."""
+        if not self.privileged(user):
+            return await respond("⛔ `/fast` is owner-only (fast mode draws from usage credits)")
+        mode = (mode or "on").strip().lower()
+        if mode not in ("on", "off"):
+            return await respond("`/fast on` or `/fast off`")
+        s = await asyncio.to_thread(find_live_by_key, key)
+        if not s or not s.get("pane"):
+            return await respond("-# needs a live session with a tmux pane (`/revive` first)")
+        if s["status"] == "waiting":
+            st["pending_fast"] = mode
+            save_state()
+            return await respond(f"⏳ **{s['name']}** is showing a prompt — `/fast {mode}` goes in once "
+                                 "it's answered")
+        ok, out = await self.type_slash(s, f"/fast {mode}")
+        if not ok:
+            return await respond(f"⚠️ couldn't type into pane `{s['pane']}`: {out[:100]}")
+        await asyncio.sleep(1.8)
+        said = await asyncio.to_thread(fast_result, s["pane"])
+        await respond(f"⚡ **{s['name']}**: {said or f'sent `/fast {mode}` (no answer on screen yet — `/screen` to check)'}")
+
+    async def global_fast(self, user, respond, mode):
+        """`/fast <on|off> everywhere` (owner only): every live claude, plus "fastMode" in
+        settings.json so new and restarted sessions start that way. Reports what each session's
+        Claude Code answered, grouped (e.g. '5× Fast mode ON · 2× Fast mode disabled · …')."""
+        if not self.privileged(user):
+            return await respond("⛔ `/fast` is owner-only (fast mode draws from usage credits)")
+        mode = (mode or "on").strip().lower()
+        if mode not in ("on", "off"):
+            return await respond("`/fast on everywhere` or `/fast off everywhere`")
+        typed, queued, skipped, panes = [], [], [], set()
+        for s in sorted(await asyncio.to_thread(live_sessions), key=lambda x: x["name"]):
+            if not s.get("pane"):
+                skipped.append(f"{s['name']} (no pane)")
+                continue
+            if proc_state(s["pid"]) == "T" or s["pane"] in panes:
+                continue
+            panes.add(s["pane"])
+            st = state.get(s["key"])
+            if s["status"] == "waiting":
+                if st is not None:
+                    st["pending_fast"] = mode
+                    queued.append(s["name"])
+                continue
+            ok, _ = await self.type_slash(s, f"/fast {mode}")
+            if ok:
+                typed.append(s)
+            else:
+                skipped.append(f"{s['name']} (tmux error)")
+            await asyncio.sleep(0.3)
+        save_state()
+        await asyncio.sleep(1.8)
+        results = Counter()
+        for s in typed:
+            results[await asyncio.to_thread(fast_result, s["pane"]) or "no answer on screen yet"] += 1
+        try:
+            prev = await asyncio.to_thread(set_user_setting, "fastMode", mode == "on")
+            dflt = f"default for new/restarted sessions: fastMode `{prev}` → `{mode == 'on'}` (settings.json)"
+        except (OSError, ValueError) as e:
+            dflt = f"⚠️ couldn't update settings.json: {e}"
+        lines = [f"⚡ **fast mode {mode} everywhere** — {len(typed)} session(s)", f"-# {dflt}"]
+        if results:
+            lines.append(" · ".join(f"{n}× {r}" for r, n in results.most_common()))
+        if queued:
+            lines.append(f"⏳ queued until their prompt is answered: " + ", ".join(queued))
+        if skipped:
+            lines.append(f"⏭️ skipped: " + ", ".join(skipped))
+        await respond("\n".join(lines)[:1900])
+        self.log_event(f"⚡ fast mode {mode} everywhere: {len(typed)} sessions")
+
     async def set_effort(self, key, st, respond, level):
         """`!effort <level>` / `/effort`: change a live claude's reasoning effort by typing Claude
         Code's own `/effort <level>` into its pane (typed, not pasted, so the slash command is
@@ -4052,6 +4145,22 @@ class Bridge(discord.Client):
             await interaction.response.defer(thinking=True)
             await bridge.global_model(interaction.user, followup(interaction), name)
         globalmodel_cmd.autocomplete("name")(model_autocomplete)
+
+        @tree.command(name="fast", description="Fast mode on or off for this session, or everywhere (owner only)")
+        @discord.app_commands.default_permissions(administrator=True)
+        @discord.app_commands.describe(mode="on or off",
+                                       everywhere="every live session, and the default for new ones")
+        @discord.app_commands.choices(mode=[Choice(name="on", value="on"), Choice(name="off", value="off")])
+        async def fast_cmd(interaction: discord.Interaction, mode: str = "on", everywhere: bool = False):
+            if not bridge.privileged(interaction.user):
+                return await interaction.response.send_message(
+                    "⛔ `/fast` is owner-only (fast mode draws from usage credits)", ephemeral=True)
+            key = thread_to_key().get(interaction.channel_id)
+            await interaction.response.defer(thinking=True)
+            if everywhere or not key:
+                await bridge.global_fast(interaction.user, followup(interaction), mode)
+            else:
+                await bridge.set_fast(key, state[key], interaction.user, followup(interaction), mode)
 
         @tree.command(name="effort", description="Set this claude's reasoning effort "
                                                  "(low/medium/high/xhigh/max)")
@@ -4704,6 +4813,10 @@ class Bridge(discord.Client):
         elif low.startswith("!globalmodel"):
             await msg.add_reaction("🧠")
             await self.global_model(msg.author, lambda t: self.say(msg.channel, t), content[12:].strip())
+        elif low == "!fast" or low.startswith("!fast "):
+            mode = next((w for w in low.split()[1:] if w in ("on", "off")), "on")
+            await msg.add_reaction("⚡")
+            await self.global_fast(msg.author, lambda t: self.say(msg.channel, t), mode)
         elif low.startswith("!astra"):
             cwd, rest = resolve_project(content[6:].split())
             await self.astra_start(msg.channel, msg.author, cwd, " ".join(rest),
@@ -4919,6 +5032,15 @@ class Bridge(discord.Client):
         if low.startswith("!globalmodel"):
             await msg.add_reaction("🧠")
             await self.global_model(msg.author, lambda t: self.say(msg.channel, t), content[12:].strip())
+            return
+        if low == "!fast" or low.startswith("!fast "):
+            words = low.split()[1:]
+            mode = next((w for w in words if w in ("on", "off")), "on")
+            await msg.add_reaction("⚡")
+            if "all" in words or "everywhere" in words:
+                await self.global_fast(msg.author, lambda t: self.say(msg.channel, t), mode)
+            else:
+                await self.set_fast(key, st, msg.author, lambda t: self.say(msg.channel, t), mode)
             return
         if low in ("!bypass", "!auto", "!mode") or low.startswith("!mode "):
             want = low[1:] if low in ("!bypass", "!auto") else content[5:].strip()

@@ -72,6 +72,7 @@ In a session's thread:
 | `/rename <name>` | Rename the session. The thread title follows. |
 | `/effort <level>` | Set reasoning effort: `low`, `medium`, `high`, `xhigh` or `max`. |
 | `/model <name>` | Switch the model: `fable`, `opus`, `sonnet`, `haiku` or a full model id. If the session is busy, the switch waits until it's idle. Owner only. |
+| `/fast [mode] [everywhere]` | Turn fast mode `on` or `off` for this session and show what Claude Code answered (fast mode draws from usage credits, and Claude Code says so if they aren't available). `everywhere` applies it to every live session and makes it the default for new ones. Owner only. |
 | `/mode <mode>` | Switch permission mode: `auto`, `bypass`, `plan` or `default`. In `auto` mode, a classifier can block actions; `bypass` turns it off for this session. |
 | `/restart [force]` | Restart the session in place (history kept), for example to pick up new settings. `force` also restarts it while it's busy. |
 | `/revive [mode]` | Bring back an ended, crashed or background session. `force` also stops a busy copy; `fork` keeps the original running. |
@@ -108,8 +109,8 @@ For all sessions at once (the output is posted in `#claudes`):
 
 In `#all-claudes`, `/hub <message>` talks to the summarizer directly (see [Channels](#channels)).
 
-`/model` and `/globalmodel` only work for the owner (`DISCORD_OWNER_ID`, or the server owner).
-Discord shows `/model`, `/globalmodel`, `/yolo`, `/restartall`, `/cleanup`, `/offload` and
+`/model`, `/globalmodel` and `/fast` only work for the owner (`DISCORD_OWNER_ID`, or the server owner).
+Discord shows `/model`, `/globalmodel`, `/fast`, `/yolo`, `/restartall`, `/cleanup`, `/offload` and
 `/restore` only to admins unless you change that in the server's integration settings.
 
 Every command also works as text in the same place: `!screen`, `!kill hard`, `!restart all`,
