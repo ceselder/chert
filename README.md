@@ -325,7 +325,7 @@ systemd/templates/    unit templates rendered by setup.sh for your user and path
 sandbox/              AppArmor profile for Codex's bubblewrap sandbox (Ubuntu 24.04)
 static/, templates/   dashboard assets
 docs/IDEAS.md         ranked backlog of ideas
-LICENSE               MIT (code); the Chert artwork is not covered, see §15
+LICENSE               MIT (code) · NOTICE: the Chert artwork is not covered, see §15
 ```
 
 ## 15. License & credits
