@@ -4,7 +4,7 @@
 
 <h1 align="center">chert 🔭</h1>
 
-<p align="center"><i>Watch, steer, launch, fork and revive a whole fleet of Claude Code sessions from Discord.</i></p>
+<p align="center"><i>Run your claudes from Discord. "Claude tag at home"</i></p>
 
 **Run a fleet of Claude Code sessions from Discord.** Every Claude Code session on your box
 becomes a Discord thread you can read and type into from your phone. Launch new ones, watch
