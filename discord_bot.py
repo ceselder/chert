@@ -2829,6 +2829,9 @@ class Bridge(discord.Client):
                 continue  # a summon/restart is mid-flight and owns this session's thread
             if (st is None or st.get("ended")) and self.pane_claimed(s.get("pane")):
                 continue  # the bridge launched it a moment ago; the launcher opens its thread
+            if st is not None and st.get("ended") and st.get("ended_reason") in ("idle", "killed") \
+                    and time.time() - (st.get("ended_at") or 0) < 90:
+                continue  # we SIGTERMed it ourselves a moment ago; it is still on its way out
             if st is not None and st.get("ended") and st.get("thread"):
                 # This exact process is live again although we recorded it as ended: it only
                 # dropped out of one registry read. Keep its thread; never open a twin over it.
