@@ -155,10 +155,30 @@ logged in with `codex login`.
 
 ## Astra
 
-`/astra <prompt>` opens a thread connected to a Codex session (`gpt-6-astra` by default). Each
-message you write in the thread is one turn. `!effort <level>` sets its reasoning effort (up to
-`ultra`) and `/kill` ends it. In a Claude session's thread, `/fork to: astra` hands that conversation to a new
-Astra session.
+`/astra <prompt>` opens a thread connected to a Codex thread (`gpt-6-astra` by default). The
+thread lives in Codex's own **app-server daemon** (`codex app-server daemon`, a background
+process chert starts on demand, with its own `CODEX_HOME` at `~/.codex-bridge`); chert talks to
+it over its Unix socket and mirrors what happens into Discord:
+
+- Each message you write is a turn. While a turn runs, a card in the thread shows what Astra is
+  doing (the command it is running, its latest reasoning summary, elapsed time, tool tally) and
+  collapses to one line when the turn ends. Replies are posted under Astra's own name.
+- A message that arrives mid-turn is **steered into the running turn** (`turn/steer`), so you can
+  correct it without waiting. `!queue <message>` queues it for after the turn instead. The bot's
+  reaction on your message is its receipt: 📨 sent · ⏳ queued · 👀 read · ✅ answered · ❌ failed.
+- When Codex wants to step outside its sandbox it asks, and the question arrives as buttons
+  (allow once · allow for session · deny · cancel turn; "always allow this command" when Codex
+  proposes a rule). `ASTRA_APPROVAL_POLICY=never` turns the asking off.
+- The card's buttons: **⏹ Interrupt**, **✋ Interrupt & say…**, **⚡ Fast** (Codex's priority
+  service tier, from the next request). In the thread: `!stop`, `!effort <level>` (up to `ultra`),
+  `!model <name>` (owner), `!fast [on|off]`, `!kill [delete]`, `!help`.
+- Restarting chert does not stop a running Astra turn: the daemon runs it, and the bot picks the
+  thread up again when it comes back, posting whatever it missed.
+
+In a Claude session's thread, `/fork to: astra` hands that conversation to a new Astra session (the
+transcript is rendered to a handoff file that Astra reads first). Threads from before the daemon
+(created with `codex exec`) are resumed in it on their next message; if their history can't be
+found, Astra starts fresh and says so.
 
 ## How it works
 
@@ -191,8 +211,10 @@ defaults; `setup.sh` fills in the Discord ones. Settings you may want to change:
 
 ## Running it
 
-- `setup.sh` installs three services: `chert-tmux`, `chert-discord-bridge`, and `chert-checkin`
-  (the dashboard, on `127.0.0.1:8899`). To follow the bot's log: `journalctl -u chert-discord-bridge -f`.
+- `setup.sh` installs four services: `chert-tmux`, `chert-codex-daemon` (makes sure Codex's
+  app-server daemon is running for Astra; `codex app-server daemon version` shows its state, with
+  `CODEX_HOME=~/.codex-bridge`), `chert-discord-bridge`, and `chert-checkin` (the dashboard, on
+  `127.0.0.1:8899`). To follow the bot's log: `journalctl -u chert-discord-bridge -f`.
 - It also installs `chert-watchdog.timer`, which runs `bin/chert-watchdog` every 2 minutes. The bot
   rewrites `~/.claude/chert-heartbeat` every few seconds. If that file is more than 6 minutes old,
   the watchdog restarts the bot. If two restarts in an hour don't help (or the service has
@@ -201,8 +223,9 @@ defaults; `setup.sh` fills in the Discord ones. Settings you may want to change:
   fixer starts. `bin/chert-watchdog --status` shows what the watchdog sees, and creating
   `~/.claude/chert-watchdog.pause` turns it off. It leaves a service alone after you stop it
   with `systemctl stop`.
-- To update: `git pull && sudo systemctl restart chert-discord-bridge`. Running sessions are not
-  affected, but an Astra turn or the GPT half of a Feldspar review that is in progress is stopped.
+- To update: `git pull && sudo systemctl restart chert-discord-bridge`. Running sessions and
+  Astra turns are not affected (Astra runs in the Codex daemon, which the restart leaves alone),
+  but the GPT half of a Feldspar review that is in progress is stopped.
 - The dashboard has no login and can type into sessions. Keep it on localhost, or put it behind
   nginx with basic auth or behind `dashboard_proxy.py`.
 
@@ -234,7 +257,9 @@ defaults; `setup.sh` fills in the Discord ones. Settings you may want to change:
 | File | What it is |
 |---|---|
 | `discord_bot.py` | The bot. |
+| `codex_backend.py` | Astra: the Codex app-server client, activity cards, approvals, daemon start (`python codex_backend.py ensure-daemon`). |
 | `app.py` | The dashboard, and the transcript parser the bot uses. |
+| `tests/` | Offline tests for the Codex backend (`pytest tests/`) and `live_astra.py`, which exercises the real daemon with a fake Discord. |
 | `ash_twin.py` | S3 backup and offloading. |
 | `setup.sh`, `setup_discord.py` | The installer. |
 | `hooks/` | The Claude Code hooks. |

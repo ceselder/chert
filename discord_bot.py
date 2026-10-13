@@ -62,6 +62,7 @@ import discord
 from aiohttp import web
 
 import app as checkin
+import codex_backend
 
 # .env first: ash_twin reads S3_BUCKET etc. at import time, so loading it afterwards would
 # silently disable S3 for anyone running `python discord_bot.py` outside systemd.
@@ -157,15 +158,16 @@ FELDSPAR_TIMEOUT = int(os.environ.get("FELDSPAR_TIMEOUT", "10800"))  # codex wal
 FELDSPAR_CODEX_SANDBOX = os.environ.get("FELDSPAR_CODEX_SANDBOX", "read-only")
 FELDSPAR_CODEX_UNSANDBOXED_FALLBACK = os.environ.get("FELDSPAR_CODEX_UNSANDBOXED_FALLBACK", "1") == "1"
 # ---------- Astra: a GPT-6 (codex) session as a Discord thread ----------
-# `!astra [dir] <prompt>` / `/astra` opens a thread bound to a codex thread. Every message in
-# it runs one headless `codex exec resume <thread> --json` turn; the events feed an activity
-# card edited in place and the final answer is posted. The codex thread id is persisted in
-# state["_astra"], so the conversation survives bridge restarts.
+# `!astra [dir] <prompt>` / `/astra` opens a thread bound to a thread in codex's app-server
+# daemon (codex_backend.py: `codex app-server daemon`, JSON-RPC over its unix socket). Every
+# message in it is a turn — steered into the running turn when one is in flight — streamed into
+# an activity card edited in place; agent messages are posted, approval requests become buttons.
+# The codex thread id is persisted in state["_astra"]; the daemon runs the turn, so a bridge
+# restart mid-turn only reconnects.
 ASTRA_MODEL = os.environ.get("ASTRA_MODEL", "gpt-6-astra")
 ASTRA_EFFORT = os.environ.get("ASTRA_EFFORT", "xhigh")
 ASTRA_SANDBOX = os.environ.get("ASTRA_SANDBOX", "workspace-write")  # danger-full-access when bwrap can't start
-ASTRA_TURN_TIMEOUT = int(os.environ.get("ASTRA_TURN_TIMEOUT", "10800"))
-ASTRA_RETRIES = int(os.environ.get("ASTRA_RETRIES", "2"))  # retries on transient codex model-cache errors
+ASTRA_TURN_TIMEOUT = int(os.environ.get("ASTRA_TURN_TIMEOUT", "10800"))   # soft wall clock: interrupt after
 ASTRA_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ASTRA_PREFIX = "🛰️"
 ASTRA_LOG_DIR = Path(os.environ.get("ASTRA_LOG_DIR", str(Path.home() / "shared" / "astra")))
@@ -1954,9 +1956,9 @@ class Bridge(discord.Client):
         self._offload_lock = asyncio.Lock()
         self._rebooted = False
         self._sent = {}          # session key -> deque of (ts, text) typed in via Discord
-        self._astra_busy = set()   # Astra thread ids with a codex turn in flight
-        self._astra_queue = {}     # Astra thread id -> messages that arrived mid-turn
-        self._astra_procs = {}     # Astra thread id -> running codex process
+        # Astra (GPT threads) live in codex's app-server daemon; codex_backend.py owns the client,
+        # the cards and the approvals, and is handed this module for state/save_state/helpers
+        self.astra = codex_backend.AstraBackend(self, sys.modules[__name__])
         self.slash_error = None  # why slash commands didn't register, if they didn't
         self._tick_lock = asyncio.Lock()   # hook fast-paths and the poller share one tick
         self._hook_backlog = []            # events that arrived before the bridge was ready
@@ -1979,6 +1981,7 @@ class Bridge(discord.Client):
 
     async def setup_hook(self):
         self.poller = asyncio.create_task(self.poll_loop())
+        self.astra.start()      # event/card loops + reconnect to codex, picking up in-flight Astra turns
         try:
             await self.start_hook_server()
         except OSError as e:
@@ -3103,6 +3106,10 @@ class Bridge(discord.Client):
             cid = (interaction.data or {}).get("custom_id", "")
             if cid.startswith("m|"):
                 await self.on_say_modal(interaction, cid.split("|")[1])
+            elif cid.startswith("xm|"):                           # Astra: Interrupt & say…
+                await self.astra.on_say_modal(interaction, cid.split("|")[1])
+            elif cid.startswith("xq|"):                           # Astra: codex's questions form
+                await self.astra.on_questions_modal(interaction, cid.split("|", 1)[1])
             return
         if interaction.type != discord.InteractionType.component:
             return
@@ -3110,6 +3117,10 @@ class Bridge(discord.Client):
         parts = cid.split("|")
         if len(parts) == 3 and parts[0] == "c":
             return await self.on_card_button(interaction, parts[1], parts[2])
+        if len(parts) == 3 and parts[0] == "x":                  # Astra card: `x|<thread>|<action>`
+            return await self.astra.on_button(interaction, parts[1], parts[2])
+        if len(parts) == 3 and parts[0] == "xa":                 # Astra approval: `xa|<request>|<n>`
+            return await self.astra.on_approval(interaction, parts[1], parts[2])
         if len(parts) == 2 and parts[0] == "rv":
             return await self.on_resurrect(interaction, parts[1])
         if len(parts) == 3 and parts[0] == "rp":              # !resume list: paging
@@ -5404,16 +5415,19 @@ class Bridge(discord.Client):
         return ("handed to the Claude reviewer to fold in." if ok
                 else f"couldn't hand it to the Claude reviewer ({err}) — **not merged**.")
 
-    # ---------- Astra: GPT-6 sessions as threads ----------
+    # ---------- Astra: GPT-6 sessions as threads (codex app-server; see codex_backend.py) ----------
 
     @staticmethod
     def astra_entries():
         return state.setdefault("_astra", {})
 
-    async def astra_start(self, parent, user, cwd, prompt, respond, title=None, show=None, extra=None):
+    async def astra_start(self, parent, user, cwd, prompt, respond, title=None, show=None, extra=None,
+                          source_message=None):
         """`!astra [dir] <prompt>` / `/astra`: open a thread bound to a brand-new codex thread
-        (GPT-6 Astra) and run the first turn in it. `title`/`show` override the thread name
-        and the quoted first line (handoffs quote the source, not the long briefing)."""
+        (GPT-6 Astra, in the app-server daemon) and run the first turn in it. `title`/`show`
+        override the thread name and the quoted first line (handoffs quote the source, not the
+        long briefing). `parent` is a text channel (or a thread's parent channel); with
+        `source_message` the thread is opened on that message instead of as a fresh thread."""
         prompt = (prompt or "").strip()
         if not prompt:
             return await respond("`!astra [dir] <prompt>` — what should Astra do?")
@@ -5425,14 +5439,18 @@ class Bridge(discord.Client):
             sandbox, degraded = "danger-full-access", True
         title = (title or f"{ASTRA_PREFIX} astra · {slug(prompt, 40)}")[:100]
         try:
-            thread = await parent.create_thread(name=title, type=discord.ChannelType.public_thread,
-                                                auto_archive_duration=10080)
+            if source_message is not None:
+                thread = await source_message.create_thread(name=title, auto_archive_duration=10080)
+            else:
+                thread = await parent.create_thread(name=title, type=discord.ChannelType.public_thread,
+                                                    auto_archive_duration=10080)
         except discord.HTTPException as e:
             return await respond(f"❌ couldn't open a thread: `{e}`")
         who = getattr(user, "display_name", str(user))
         self.astra_entries()[str(thread.id)] = {
-            "codex_thread": None, "cwd": str(cwd), "sandbox": sandbox, "effort": ASTRA_EFFORT,
-            "name": slug(prompt, 40), "created": time.time(), "turns": 0, "ended": False, "by": who,
+            "codex_thread": None, "backend": "app-server", "cwd": str(cwd), "sandbox": sandbox,
+            "effort": ASTRA_EFFORT, "model": ASTRA_MODEL, "name": slug(prompt, 40), "created": time.time(),
+            "turns": 0, "ended": False, "by": who, "parent": getattr(parent, "id", None),
             **(extra or {})}
         save_state()
         await self.say(thread, f"🛰️ **Astra** — `{ASTRA_MODEL}` @ `{ASTRA_EFFORT}` in `{cwd}` · sandbox "
@@ -5440,7 +5458,7 @@ class Bridge(discord.Client):
                                + (" (bubblewrap can't start here — see README → Feldspar sandbox)"
                                   if degraded else "")
                                + f"\n-# reply here to talk to it · `!effort {'|'.join(ASTRA_EFFORTS)}` · "
-                               f"`!kill` ends it · started by {who}\n"
+                               f"`!stop` · `!kill` ends it · `!help` · started by {who}\n"
                                + (show if show else f"> {one_line(prompt, 300)}"))
         await respond(f"🛰️ Astra is on it → <#{thread.id}>")
         asyncio.create_task(self.astra_turn(thread, prompt, user))
@@ -5486,200 +5504,58 @@ class Bridge(discord.Client):
                                extra={"forked_from": key, "handoff": str(handoff)})
 
     async def handle_astra_message(self, msg, ent):
+        """A message in an Astra thread: `!` commands, else a turn (steered into a running one;
+        `!queue <msg>` to queue it for after instead)."""
         content = (msg.content or "").strip()
         low = content.lower()
+        thread = msg.channel
         if low == "!help":
-            return await self.send_help(msg.channel)
+            return await self.say(thread, self.astra.help_text())
         if low.startswith("!kill"):
-            return await self.astra_kill(msg.channel, ent, delete=low.endswith("delete"))
+            return await self.astra_kill(thread, ent, delete=low.endswith("delete"))
+        if low.startswith("!stop") or low in ("!esc", "!interrupt"):
+            try:
+                turn = await self.astra.interrupt(ent)
+            except Exception as e:  # noqa: BLE001
+                return await self.say(thread, f"⚠️ couldn't interrupt: `{e}`")
+            return await msg.add_reaction("⏹" if turn else "💤")
         if low.startswith("!effort"):
-            eff = content[7:].strip().lower()
-            if eff not in ASTRA_EFFORTS:
-                return await self.say(msg.channel, f"-# efforts: {', '.join(ASTRA_EFFORTS)} "
-                                                   f"(now `{ent.get('effort', ASTRA_EFFORT)}`)")
-            ent["effort"] = eff
+            if await self.astra.set_effort(thread, ent, content[7:]) is True:
+                await msg.add_reaction("✅")
+            return
+        if low.startswith("!model"):
+            return await self.astra.set_model(thread, ent, msg.author, content[6:])
+        if low == "!fast" or low.startswith("!fast "):
+            ent["fast"] = next((w == "on" for w in low.split()[1:] if w in ("on", "off")), not ent.get("fast"))
             save_state()
-            return await msg.add_reaction("✅")
-        if low.startswith("!"):
-            return await self.say(msg.channel, "-# Astra threads take plain messages, `!effort <level>`, "
-                                               "`!kill`, `!help`")
+            await self.astra.set_tier(ent)
+            return await msg.add_reaction("⚡" if ent["fast"] else "🐢")
+        queue = False
+        if low.startswith("!queue"):
+            content, queue = content[6:].strip(), True
+        elif low.startswith("!"):
+            return await self.say(thread, "-# Astra threads take plain messages, `!stop`, `!effort <level>`, "
+                                          "`!model <name>`, `!fast [on|off]`, `!queue <msg>`, `!kill`, `!help`")
         if ent.get("ended"):
-            return await self.say(msg.channel, "-# 🌌 this Astra session was ended")
+            return await self.say(thread, "-# 🌌 this Astra session was ended")
         attached = await self.save_attachments(msg)
         payload = f"{content}\n{attached}".strip() if attached else content
         if payload:
-            await self.astra_turn(msg.channel, payload, msg.author, react_msg=msg)
+            await self.astra_turn(thread, payload, msg.author, react_msg=msg, queue=queue)
 
-    async def astra_turn(self, thread, text, user, react_msg=None):
-        """One turn, serialised per thread: messages that land mid-turn are queued and sent
-        together when it ends."""
-        tid = str(thread.id)
-        ent = self.astra_entries().get(tid)
+    async def astra_turn(self, thread, text, user, react_msg=None, queue=False):
+        """One Discord message into the codex thread: a new turn when it is idle, steered into
+        the running turn otherwise (or queued behind it with `queue=True`). The message's bot
+        reaction is its read receipt: 📨 sent · ⏳ queued · 👀 read · ✅ answered · ❌ failed."""
+        ent = self.astra_entries().get(str(thread.id))
         if not ent or ent.get("ended"):
             return
-        if tid in self._astra_busy:
-            self._astra_queue.setdefault(tid, []).append(text)
-            if react_msg:
-                await react_msg.add_reaction("⏳")
-            return
-        self._astra_busy.add(tid)
-        try:
-            await self._astra_run(thread, ent, text, user, react_msg)
-            while (queued := self._astra_queue.pop(tid, None)) and not ent.get("ended"):
-                await self._astra_run(thread, ent, "\n\n".join(queued), user, None)
-        finally:
-            self._astra_busy.discard(tid)
-
-    ASTRA_TRANSIENT = ("requires a newer version", "failed to refresh available models",
-                       "timeout waiting for child process")
-
-    async def _astra_run(self, thread, ent, text, user, react_msg):
-        """One turn. Codex's background model-catalog refresh is flaky (it times out and can
-        briefly corrupt ~/.codex/models_cache.json); when that races a turn, the server
-        rejects gpt-6-astra with a misleading 'requires a newer version of Codex'. That is
-        transient — a fresh launch re-reads a good cache — so retry a couple of times."""
-        tid = str(thread.id)
-        who = getattr(user, "display_name", None)
-        prompt = text if (user is None or getattr(user, "id", None) == self.owner or not who) \
-            else f"{who}: {text}"
-        ASTRA_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        errlog, evlog = ASTRA_LOG_DIR / f"{tid}.stderr.log", ASTRA_LOG_DIR / f"{tid}.events.jsonl"
-        card = await self.say(thread, "\U0001f6f0\ufe0f **Astra is working** \u00b7 \u23f1 0 min")
-        t0 = time.time()
-        had_thread = bool(ent.get("codex_thread"))   # first turn creates the codex thread
-
-        async def attempt():
-            cmd = [CODEX_BIN, "exec"]
-            cmd += ["resume", ent["codex_thread"]] if ent.get("codex_thread") else ["-C", ent["cwd"]]
-            cmd += ["--json", "--skip-git-repo-check", "-m", ASTRA_MODEL,
-                    "-c", f'model_reasoning_effort="{ent.get("effort", ASTRA_EFFORT)}"',
-                    "-c", f'sandbox_mode="{ent["sandbox"]}"',
-                    "-c", "sandbox_workspace_write.network_access=true", prompt]
-            acts, seen, errors = deque(maxlen=5), set(), []
-            final, usage, last_edit = None, None, 0.0
-
-            async def show(done=False, rc=None):
-                if card is None:
-                    return
-                mins = (time.time() - t0) / 60
-                head = ("\U0001f6f0\ufe0f **Astra is working**" if not done else
-                        "\U0001f6f0\ufe0f **Astra turn done**" if rc == 0 else f"\u26a0\ufe0f **Astra turn ended (rc={rc})**")
-                tok = (f" \u00b7 {usage.get('input_tokens', 0) // 1000}k in / {usage.get('output_tokens', 0) // 1000}k out"
-                       if usage else "")
-                body = "\n".join([f"{head} \u00b7 \u23f1 {mins:.0f} min{tok}"] + [f"-# {a}" for a in acts])[:1900]
-                try:
-                    await card.edit(content=body, suppress=True, allowed_mentions=NO_PING)
-                except discord.HTTPException as e:
-                    log_error("astra card", e)
-
-            def note(ev):
-                nonlocal final, usage
-                typ = ev.get("type", "")
-                if typ == "thread.started" and ev.get("thread_id"):
-                    if ent.get("codex_thread") != ev["thread_id"]:
-                        ent["codex_thread"] = ev["thread_id"]
-                        save_state()
-                elif typ in ("item.started", "item.completed", "item.updated"):
-                    it = ev.get("item") or {}
-                    kind, iid = it.get("type"), it.get("id")
-                    if kind == "agent_message":
-                        if typ == "item.completed" and it.get("text"):
-                            final = it["text"]
-                            acts.append("\U0001f4ac " + one_line(final))
-                    elif kind == "command_execution":
-                        if iid not in seen:
-                            seen.add(iid)
-                            acts.append("$ " + one_line(it.get("command")))
-                        if typ == "item.completed" and it.get("exit_code") not in (None, 0):
-                            acts.append(f"\u21b3 exit {it.get('exit_code')}: " + one_line(it.get("aggregated_output"), 90))
-                    elif kind == "reasoning" and typ == "item.completed":
-                        acts.append("\U0001f9e0 " + one_line(it.get("text") or it.get("summary")))
-                    elif kind == "file_change" and typ == "item.completed":
-                        names = ", ".join(Path(str(c.get("path", "?"))).name for c in (it.get("changes") or [])[:4])
-                        acts.append(f"\u270f\ufe0f {names or 'files changed'}")
-                    elif kind == "web_search":
-                        if iid not in seen:
-                            seen.add(iid)
-                            acts.append("\U0001f50e " + one_line(it.get("query"), 100))
-                    elif kind == "error":
-                        errors.append(one_line(it.get("message"), 300))
-                elif typ == "turn.completed":
-                    usage = ev.get("usage")
-                elif typ in ("turn.failed", "error"):
-                    errors.append(one_line(json.dumps(ev.get("error") or ev), 300))
-
-            try:
-                with open(errlog, "ab") as ef:
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd, cwd=ent["cwd"], env=codex_env(), stdout=asyncio.subprocess.PIPE,
-                        stderr=ef, stdin=asyncio.subprocess.DEVNULL)
-            except OSError as e:
-                return None, None, [f"codex couldn't start: {e}"], None
-            self._astra_procs[tid] = proc
-
-            async def pump():
-                nonlocal last_edit
-                with open(evlog, "ab") as lf:
-                    while True:
-                        line = await proc.stdout.readline()
-                        if not line:
-                            break
-                        lf.write(line)
-                        try:
-                            note(json.loads(line))
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            continue
-                        if time.time() - last_edit > 4:
-                            last_edit = time.time()
-                            await show()
-
-            try:
-                await asyncio.wait_for(pump(), timeout=ASTRA_TURN_TIMEOUT)
-                rc = await proc.wait()
-            except asyncio.TimeoutError:
-                proc.kill()
-                rc = -9
-                errors.append(f"turn hit the {ASTRA_TURN_TIMEOUT // 60} min wall clock")
-            finally:
-                self._astra_procs.pop(tid, None)
-            await show(done=True, rc=rc)
-            return rc, final, errors, usage
-
-        if react_msg:
-            await react_msg.add_reaction("\U0001f6f0\ufe0f")
-        rc, final, errors, usage = None, None, [], None
-        for att in range(ASTRA_RETRIES + 1):
-            rc, final, errors, usage = await attempt()
-            transient = (rc != 0 and not final
-                         and any(any(p in e for p in self.ASTRA_TRANSIENT) for e in errors))
-            if not transient or att == ASTRA_RETRIES:
-                break
-            if not had_thread:                 # discard the empty thread the failed attempt made
-                ent["codex_thread"] = None
-                save_state()
-            await self.say(thread, f"-# \u21bb transient codex model-cache hiccup, retrying "
-                                   f"({att + 1}/{ASTRA_RETRIES})\u2026")
-            await asyncio.sleep(4)
-
-        ent["turns"] = ent.get("turns", 0) + 1
-        save_state()
-        if final:
-            await self.say(thread, final)
-        if errors:
-            await self.say(thread, "\u26a0\ufe0f " + "\n\u26a0\ufe0f ".join(errors[-3:]))
-        if rc != 0 and not final:
-            tail = errlog.read_text(errors="replace")[-700:] if errlog.exists() else ""
-            await self.say(thread, f"\u26a0\ufe0f codex ended with rc={rc} and no answer. stderr tail:\n```\n{tail}\n```")
-        if react_msg:
-            await react_msg.add_reaction("\u2705" if rc == 0 and final else "\u274c")
+        if react_msg is not None and not isinstance(react_msg, discord.Message):
+            react_msg = None          # a slash-command stand-in has no message to react to
+        await self.astra.send(thread, ent, text, user, react_msg=react_msg, queue=queue)
 
     async def astra_kill(self, thread, ent, delete=False):
-        proc = self._astra_procs.get(str(thread.id))
-        if proc and proc.returncode is None:
-            proc.kill()
-        ent["ended"] = True
-        self._astra_queue.pop(str(thread.id), None)
-        save_state()
+        await self.astra.kill(thread, ent)
         try:
             if delete:
                 await thread.delete()
