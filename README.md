@@ -86,7 +86,7 @@ In a session's thread:
 | `/refresh [message] [force]` | Unstick the session. Sends Esc first. If it stays stuck, restarts the session in place (history kept) in bypass mode, so auto-mode classifier blocks can't wedge it again (`/mode auto` turns the classifier back on). `message` is sent once it responds. If the session is idle and was active in the last five minutes, it isn't treated as stuck: only `message` is sent, unless `force` is set. |
 | `/stop` | Interrupt the running turn (the terminal's Esc). |
 | `/yolo [duration] [everywhere]` | Turn permission checks off for this session for a while (`30m`, default `1h`, at most `12h`), then switch back to the mode it had. `off` ends it early. `everywhere` instead applies to every session started in that window. Owner only. |
-| `/screen` | Show the terminal screen. |
+| `/screen [text]` | Show the terminal as an image: its real colours, re-wrapped to read on a phone (`text` gives copyable text instead). |
 | `/key <key>` | Press a key: `esc`, `enter`, arrow keys, `tab`, `shift-tab`, `space`, `pgup`, `pgdn`, `1`–`9`. |
 | `/fork [message] [to]` | Copy the session and its history into a new session with its own thread. With `to: astra`, the conversation goes to a GPT session instead. |
 | `/rename <name>` | Rename the session. The thread title follows. |

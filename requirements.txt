@@ -7,3 +7,6 @@ boto3>=1.40
 # voice messages -> text, on the CPU (optional: without it audio is just an attachment)
 faster-whisper>=1.2
 av>=11,<16          # faster-whisper 1.2 passes metadata_errors=, which PyAV 16+ removed
+# /screen as an image (screenshot.py)
+pillow>=10
+fonttools>=4.40

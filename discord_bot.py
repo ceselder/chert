@@ -43,6 +43,7 @@ DISCORD_OWNER_ID (defaults to guild owner), POLL_SECS (default 4). See .env.exam
 """
 import asyncio
 import fcntl
+import io
 import json
 import os
 import re
@@ -64,6 +65,7 @@ from aiohttp import web
 
 import app as checkin
 import audio as voice
+import screenshot
 import codex_backend
 import worktrees
 
@@ -3509,6 +3511,17 @@ class Bridge(discord.Client):
         await respond(f"🗄️ archived **{pr['name']}** — running sessions can finish; new prompts are refused"
                       if archive else f"📁 **{pr['name']}** is back")
 
+    async def screen_file(self, s):
+        """The session's terminal as a PNG (screenshot.py) ready to upload, or None."""
+        if not s.get("pane"):
+            return None
+        try:
+            png = await asyncio.to_thread(screenshot.render, s["pane"])
+        except Exception as e:  # noqa: BLE001 — fall back to text
+            log_error("screenshot", e)
+            return None
+        return discord.File(io.BytesIO(png), filename=f"screen-{slug(s.get('name') or 'claude', 30)}.png") if png else None
+
     # ---------- voice messages ----------
 
     def vocabulary(self):
@@ -3600,7 +3613,12 @@ class Bridge(discord.Client):
         elif action == "scr":
             text = await asyncio.to_thread(screen_text, s["pane"])
             opts = parse_options(text)[0] if s["status"] == "waiting" else []
-            await ephemeral(prompt_body(text), **({"view": prompt_view(key, opts)} if s["status"] == "waiting" else {}))
+            extra = {"view": prompt_view(key, opts)} if s["status"] == "waiting" else {}
+            shot = await self.screen_file(s)
+            if shot:
+                await ephemeral(f"-# 🖥 **{s['name']}**", file=shot, **extra)
+            else:
+                await ephemeral(prompt_body(text), **extra)
         elif action == "fast":
             info = await asyncio.to_thread(screen_info, s["pane"])
             on = st.get("speed") == "fast" or info.get("fast_on")
@@ -5368,8 +5386,9 @@ class Bridge(discord.Client):
 
         # in a session's thread
         @tree.command(name="screen", description="Show this session's terminal screen")
-        async def screen_cmd(interaction: discord.Interaction):
-            await run_as_text(interaction, "!screen", "thread")
+        @discord.app_commands.describe(text="copyable text instead of a screenshot")
+        async def screen_cmd(interaction: discord.Interaction, text: bool = False):
+            await run_as_text(interaction, "!screen text" if text else "!screen", "thread")
 
         @tree.command(name="key", description="Press a key in this session's terminal")
         @discord.app_commands.describe(key="the key to press")
@@ -6456,14 +6475,20 @@ class Bridge(discord.Client):
                                f"-# 🌌 this session ended ({st.get('ended_reason', 'exit')}) — "
                                "`!revive` resumes it with its history")
             return
-        if low == "!screen":
+        if low in ("!screen", "!screen text"):
             if not s["pane"]:
                 await msg.channel.send(NO_PANE_HELP, allowed_mentions=NO_PING)
                 return
             text = await asyncio.to_thread(screen_text, s["pane"])
             opts = parse_options(text)[0] if s["status"] == "waiting" else []
-            await msg.channel.send(prompt_body(text),
-                                   view=prompt_view(key, opts) if s["status"] == "waiting" else None)
+            view = prompt_view(key, opts) if s["status"] == "waiting" else None
+            shot = None if low.endswith("text") else await self.screen_file(s)
+            if shot:
+                await msg.channel.send(f"-# 🖥 **{s['name']}** · {STATUS_WORD.get(s['status'], s['status'])} · "
+                                       "`/screen text` for copyable text", file=shot, view=view,
+                                       allowed_mentions=NO_PING)
+            else:
+                await msg.channel.send(prompt_body(text), view=view)
             return
         if low.startswith("!key"):
             tmux_key = KEYMAP.get(content[4:].strip().lower())  # never shadow `key`
