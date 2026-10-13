@@ -1,7 +1,7 @@
 [Unit]
 Description=chert: Discord bridge (one thread per live claude session)
-After=network-online.target chert-tmux.service
-Wants=network-online.target chert-tmux.service
+After=network-online.target chert-tmux.service chert-codex-daemon.service
+Wants=network-online.target chert-tmux.service chert-codex-daemon.service
 
 [Service]
 User=@USER@

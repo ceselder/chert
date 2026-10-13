@@ -73,19 +73,29 @@ if (( DRY )); then echo "  [dry-run] would run hooks/install_hooks.py"; else "$V
 
 say "7/7 systemd units"
 mkdir -p systemd/rendered
+# the Codex app-server daemon Astra runs in: which codex binary, and the bridge's private CODEX_HOME
+envval() { grep -E "^$1=.+" .env 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/[[:space:]]*#.*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/" || true; }
+CODEX="$(envval CODEX_BIN)"; [[ -n "$CODEX" ]] || CODEX="$(command -v codex || true)"; [[ -n "$CODEX" ]] || CODEX="$HOME_DIR/.local/bin/codex"
+CODEX_HOME_DIR="$(envval CODEX_BRIDGE_HOME)"; [[ -n "$CODEX_HOME_DIR" ]] || CODEX_HOME_DIR="$HOME_DIR/.codex-bridge"
 for tpl in systemd/templates/*.in; do
   unit="$(basename "${tpl%.in}")"
-  sed -e "s|@USER@|$ME|g" -e "s|@HOME@|$HOME_DIR|g" -e "s|@APP@|$APP|g" -e "s|@VENV@|$VENV|g" "$tpl" > "systemd/rendered/$unit"
+  sed -e "s|@USER@|$ME|g" -e "s|@HOME@|$HOME_DIR|g" -e "s|@APP@|$APP|g" -e "s|@VENV@|$VENV|g" \
+      -e "s|@CODEX@|$CODEX|g" -e "s|@CODEX_HOME@|$CODEX_HOME_DIR|g" "$tpl" > "systemd/rendered/$unit"
 done
-ok "rendered $(ls systemd/rendered | wc -l) units for user $ME at $APP → systemd/rendered/"
+ok "rendered $(ls systemd/rendered | wc -l) units for user $ME at $APP → systemd/rendered/ (codex: $CODEX, CODEX_HOME: $CODEX_HOME_DIR)"
 if (( NO_SYSTEMD || DRY )) || ! command -v systemctl >/dev/null; then
   echo "  install them yourself:"; echo "    sudo cp systemd/rendered/*.service systemd/rendered/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload"
-  echo "    sudo systemctl enable --now chert-tmux chert-discord-bridge chert-checkin chert-watchdog.timer"
+  echo "    sudo systemctl enable --now chert-tmux chert-codex-daemon chert-discord-bridge chert-checkin chert-watchdog.timer"
 elif sudo -n true 2>/dev/null || [[ -t 0 ]]; then
   sudo cp systemd/rendered/*.service systemd/rendered/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload
+  if [[ -x "$CODEX" ]]; then
+    sudo systemctl enable --now chert-codex-daemon || warn "chert-codex-daemon didn't start (journalctl -u chert-codex-daemon); Astra starts the daemon itself on first use"
+  else
+    warn "codex not found at $CODEX — chert-codex-daemon not enabled (Astra needs it; set CODEX_BIN in .env and re-run)"
+  fi
   sudo systemctl enable --now chert-tmux chert-discord-bridge chert-checkin chert-watchdog.timer
   sleep 3
-  for u in chert-tmux chert-discord-bridge chert-checkin; do printf '  %-22s %s\n' "$u" "$(systemctl is-active "$u")"; done
+  for u in chert-tmux chert-codex-daemon chert-discord-bridge chert-checkin; do printf '  %-22s %s\n' "$u" "$(systemctl is-active "$u")"; done
   echo "  logs:  journalctl -u chert-discord-bridge -f"
 else
   warn "no sudo — units are in systemd/rendered/; copy them as shown above"

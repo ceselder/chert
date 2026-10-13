@@ -1,0 +1,23 @@
+[Unit]
+Description=chert: the Codex app-server daemon that Astra (GPT) threads run in
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@
+# The bridge's private CODEX_HOME (auth is a symlink to ~/.codex/auth.json; see codex_backend.py).
+Environment=CODEX_HOME=@CODEX_HOME@
+Environment=CODEX_BRIDGE_HOME=@CODEX_HOME@
+Environment=CODEX_BIN=@CODEX@
+Environment="PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# No EnvironmentFile=.env here on purpose: the daemon, and every command the model runs in
+# it, must not inherit the Discord bot token.
+# Seeds CODEX_HOME and runs `codex app-server daemon start` — a no-op when it already runs.
+ExecStart=@VENV@/bin/python @APP@/codex_backend.py ensure-daemon
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
