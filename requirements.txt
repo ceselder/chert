@@ -4,3 +4,6 @@ gunicorn==26.0.0
 discord.py==2.7.1
 python-dotenv==1.2.2
 boto3>=1.40
+# voice messages -> text, on the CPU (optional: without it audio is just an attachment)
+faster-whisper>=1.2
+av>=11,<16          # faster-whisper 1.2 passes metadata_errors=, which PyAV 16+ removed

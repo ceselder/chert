@@ -54,6 +54,7 @@ import subprocess
 import sys
 import time
 import types
+import typing
 import urllib.parse
 from collections import Counter, deque
 from pathlib import Path
@@ -62,6 +63,8 @@ import discord
 from aiohttp import web
 
 import app as checkin
+import audio as voice
+import worktrees
 
 # .env first: ash_twin reads S3_BUCKET etc. at import time, so loading it afterwards would
 # silently disable S3 for anyone running `python discord_bot.py` outside systemd.
@@ -310,7 +313,9 @@ HELP = ("🔭 **chert** — every Claude Code session on this box has a thread i
         "`/log [count]` timeline · `/mute` · `/unmute` · `/supernova` countdown to wrap-up\n"
         "`/kill [how]` end it · `/feldspar [focus]` Claude + GPT code review\n"
         "\n**Anywhere**\n"
-        "`/claude <prompt>` start a session · `/resume <session>` bring back any past one\n"
+        "`/claude <prompt> [worktree]` start a session · `/resume <session>` bring back any past one\n"
+        "`/project dir:<path>` a channel where a plain prompt starts a session · `/harness` · `/worktrees` · `/archive`\n"
+        "🎙️ voice messages work as prompts anywhere (transcribed on this machine)\n"
         "`/sessions` list live sessions · `/astra <prompt>` a GPT session as a thread\n"
         "`/globalmodel` · `/fast on everywhere` every session (owner) · `/yolo 1h everywhere` bypass for new sessions\n"
         "\n**Fleet** (output goes to #claudes)\n"
@@ -973,26 +978,87 @@ def _ago(secs):
     return f"{secs}s" if secs < 90 else f"{secs // 60}m" if secs < 5400 else f"{secs // 3600}h"
 
 
-def subs_text(subs, now=None, limit=4):
-    """'Explore — *Survey the fork* (4m) · general-purpose (1m) · 1 done' for the live subagents."""
+# what each subagent is doing: Claude Code writes every subagent's own transcript (and a
+# meta.json with its type/description) to <transcript minus .jsonl>/subagents/agent-<id>.*
+_SUB_PROGRESS = {}
+
+
+def subagent_progress(transcript, aid):
+    """{"meta": {...}, "tools": n, "last": "$ cmd"} for one subagent, read incrementally."""
+    if not transcript or not aid:
+        return {}
+    base = Path(transcript).with_suffix("") / "subagents"
+    path = base / f"agent-{aid}.jsonl"
+    ent = _SUB_PROGRESS.setdefault(str(path), {"off": 0, "tools": 0, "last": "", "meta": None})
+    if ent["meta"] is None:
+        try:
+            ent["meta"] = json.loads((base / f"agent-{aid}.meta.json").read_text())
+        except (OSError, ValueError):
+            pass                                  # not written yet: try again next time
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ent
+    if size > ent["off"]:
+        try:
+            with open(path, "rb") as f:
+                f.seek(ent["off"])
+                data = f.read(size - ent["off"])
+        except OSError:
+            return ent
+        cut = data.rfind(b"\n") + 1
+        ent["off"] += cut
+        for line in data[:cut].splitlines():
+            if b'"tool_use"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("type") != "assistant":
+                continue
+            for blk in (r.get("message") or {}).get("content") or []:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    ent["tools"] += 1
+                    name, summ = checkin.tool_summary(blk)
+                    ent["last"] = f"{'$ ' if name == 'Bash' else name + ' '}{_clean(summ, 80)}"
+    if len(_SUB_PROGRESS) > 400:
+        _SUB_PROGRESS.clear()
+    return ent
+
+
+def subagent_lines(subs, transcript=None, now=None, limit=4):
+    """One line per live subagent: type, description, age, tool count, what it is doing now.
+    Returns (lines, done_count)."""
     now = now or time.time()
-    live = list((subs or {}).get("live", {}).values())
-    parts = []
-    for a in live[:limit]:
+    lines = []
+    live = list(((subs or {}).get("live") or {}).items())
+    for aid, a in live[:limit]:
         if isinstance(a, str):                    # entries written by older bridges
             a = {"type": a}
-        p = a.get("type") or "agent"
-        if a.get("desc"):
-            p += f" — *{_clean(a['desc'], 60)}*"
+        prog = subagent_progress(transcript, aid)
+        meta = prog.get("meta") or {}
+        kind = a.get("type") or meta.get("agentType") or "agent"
+        desc = a.get("desc") or meta.get("description") or ""
+        bits = [kind + (f" — *{_clean(desc, 60)}*" if desc else "")]
+        if meta.get("requestShape") == "background":
+            bits[0] = "🌙 " + bits[0]
         if a.get("at"):
-            p += f" ({_ago(now - a['at'])})"
-        parts.append(p)
+            bits.append(_ago(now - a["at"]))
+        if prog.get("tools"):
+            bits.append(f"{prog['tools']} tool{'s' if prog['tools'] != 1 else ''}")
+        if prog.get("last"):
+            bits.append(f"`{prog['last']}`")
+        lines.append(" · ".join(bits)[:230])
     if len(live) > limit:
-        parts.append(f"+{len(live) - limit} more")
-    done = sum(((subs or {}).get("done") or {}).values())
-    if done:
-        parts.append(f"{done} done")
-    return " · ".join(parts)
+        lines.append(f"+{len(live) - limit} more")
+    return lines, sum(((subs or {}).get("done") or {}).values())
+
+
+def subs_text(subs, now=None, limit=4):
+    """Single-line summary (kept for callers that want one line)."""
+    lines, done = subagent_lines(subs, None, now, limit)
+    return " · ".join(lines + ([f"{done} done"] if done else []))
 
 
 INBOX_EMOJI = {"sent": "📨", "queued": "⏳", "read": "👀", "done": "✅", "pulled": "↩️", "stuck": "⚠️"}
@@ -1036,7 +1102,7 @@ def card_text(s, card, final=False, model=None, base=None, info=None):
     elif scr.get("mode"):
         badges.append(MODE_BADGE.get(scr["mode"], scr["mode"]))
     btxt = (" · " + " · ".join(badges)) if badges else ""
-    subs = info.get("subs") or ""
+    sub_lines, sub_done = info.get("sub_lines") or [], info.get("subs_done", 0)
     if final:
         live_n = info.get("subs_live", 0)
         tail = f" · 🧭 {live_n} subagent{'s' if live_n != 1 else ''} still running" if live_n else ""
@@ -1059,9 +1125,12 @@ def card_text(s, card, final=False, model=None, base=None, info=None):
                      + (f" · {scr['thought_for']}" if scr.get("thought_for") else ""))
     if card.get("thought"):
         lines.append(f"💭 {card['thought']}")
-    if subs:
+    if sub_lines:
         n = info.get("subs_live", 0)
-        lines.append(f"🧭 **{n} subagent{'s' if n != 1 else ''}**: {subs}" if n else f"🧭 {subs}")
+        lines.append(f"🧭 **{n} subagent{'s' if n != 1 else ''}**" + (f" · {sub_done} done" if sub_done else ""))
+        lines.extend(f"{'└' if i == len(sub_lines) - 1 else '├'} {l}" for i, l in enumerate(sub_lines))
+    elif sub_done:
+        lines.append(f"🧭 {sub_done} subagent{'s' if sub_done != 1 else ''} done")
     if info.get("inbox"):
         lines.append(info["inbox"])
     if info.get("stalled"):
@@ -1090,6 +1159,73 @@ def card_view(key, info=None):
     if info.get("stalled"):
         view.add_item(B(label="🔄 Unstick", style=S.danger, custom_id=f"c|{key}|unstick", row=1))
     return view
+
+
+# ---------- per-project channels (opt-in; #claudes stays the catch-all) ----------
+# state["_projects"][<channel id>] = {name, dir, harness: claude|codex, worktrees: bool, archived}
+HARNESSES = ("claude", "codex")
+ARCHIVE_CATEGORY = os.environ.get("ARCHIVE_CATEGORY", "archived projects")
+
+
+def projects():
+    return state.setdefault("_projects", {})
+
+
+def project_for_channel(cid):
+    return projects().get(str(cid))
+
+
+def project_for_cwd(cwd):
+    """(channel id, project) whose directory most closely contains `cwd` — or whose worktrees
+    it lives in. Archived projects don't collect new threads."""
+    if not cwd:
+        return None, None
+    group = worktrees.worktree_group(cwd)
+    if group and group in projects() and not projects()[group].get("archived"):
+        return group, projects()[group]
+    try:
+        c = Path(cwd).resolve()
+    except OSError:
+        return None, None
+    best = (None, None, -1)
+    for cid, pr in projects().items():
+        if pr.get("archived"):
+            continue
+        d = Path(pr["dir"])
+        if (c == d or d in c.parents) and len(d.parts) > best[2]:
+            best = (cid, pr, len(d.parts))
+    return best[0], best[1]
+
+
+def resolve_dir(text):
+    """'~/x', '/abs/x' or 'x' (under PROJECT_ROOT) -> an existing directory Path, else None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    d = Path(t).expanduser()
+    if not d.is_absolute():
+        d = PROJECT_ROOT / d
+    d = d.resolve()
+    return d if d.is_dir() else None
+
+
+def project_topic(pr):
+    return (f"📁 {pr['dir']} · type a prompt to start a {pr.get('harness', 'claude')} session here"
+            + (" (in a fresh git worktree)" if pr.get("worktrees") else "")
+            + (" · ARCHIVED" if pr.get("archived") else ""))[:1024]
+
+
+class _AudioMsg:
+    """A Discord message whose voice/audio attachments were replaced by their transcript:
+    `content` carries the text, `attachments` only the non-audio files; everything else
+    (id, channel, author, reactions, create_thread…) is the real message."""
+
+    def __init__(self, msg, content, attachments):
+        self._msg, self.content, self.attachments = msg, content, attachments
+        self.transcribed = True
+
+    def __getattr__(self, name):
+        return getattr(self._msg, name)
 
 
 # ---------- Markdown tables -> labelled rows (Discord renders pipe tables as raw text) ----------
@@ -2255,8 +2391,13 @@ class Bridge(discord.Client):
             return
         self.pair_agent_descs(st)
         n = len(subs["live"])
-        line = (f"-# 🧭 {n} subagent{'s' if n != 1 else ''} running: {subs_text(subs)}" if n
-                else f"-# 🧭 subagents done: {subs_text(subs)}")[:1990]
+        sub_lines, done = subagent_lines(subs, s.get("transcript"))
+        if n:
+            line = "\n".join([f"-# 🧭 {n} subagent{'s' if n != 1 else ''} still running"
+                              + (f" · {done} done" if done else "")] + [f"-# └ {l}" for l in sub_lines])[:1990]
+        else:
+            kinds = ", ".join(f"{t} ×{k}" if k > 1 else t for t, k in (subs.get("done") or {}).items())
+            line = f"-# 🧭 {done} subagent{'s' if done != 1 else ''} done: {kinds}"[:1990]
         parent = await self.get_thread(st.get("parent", CHANNEL_ID)) or self.main_channel
         if subs.get("msg"):
             try:
@@ -2740,7 +2881,7 @@ class Bridge(discord.Client):
                 created += 1
                 self._twin_wait.pop(key, None)
                 try:
-                    await self.open_thread(channel, s, key)
+                    await self.open_thread(await self.parent_for(s) or channel, s, key)
                 except Exception as e:  # noqa: BLE001
                     log_error(f"open_thread {key}", e)
                 continue
@@ -2886,6 +3027,21 @@ class Bridge(discord.Client):
         if st.get("card"):
             parent = await self.get_thread(st.get("parent", CHANNEL_ID)) or channel
             await self.render_card(parent, s, st)
+        subs = st.get("subs") or {}
+        if subs.get("live") and time.time() - subs.get("checked_at", 0) > 30:
+            subs["checked_at"] = time.time()
+            base = Path(s["transcript"]).with_suffix("") / "subagents" if s.get("transcript") else None
+            for aid, a in list(subs["live"].items()):
+                f = base / f"agent-{aid}.jsonl" if base else None
+                started = a.get("at", 0) if isinstance(a, dict) else 0
+                try:
+                    quiet = time.time() - f.stat().st_mtime if f else 0
+                except OSError:
+                    quiet = time.time() - started if started else 0
+                if quiet > 1800 and time.time() - started > 1800:
+                    subs["live"].pop(aid, None)     # its SubagentStop never reached us
+            if not st.get("card"):
+                await self.render_subs(key, s, st)
         # status changes: edit the intro in place; ping only on `waiting`
         if s["status"] != st["status"]:
             prev = st["status"]
@@ -3038,9 +3194,10 @@ class Bridge(discord.Client):
         if inbox and (now - inbox["at"] > 1800 or inbox["state"] == "done"):
             inbox = None
         y = st.get("yolo") or {}
+        sub_lines, sub_done = subagent_lines(subs, s.get("transcript"), now) if subs else ([], 0)
         return {"screen": scr, "speed": st.get("speed"),
                 "yolo_until": y.get("until") if y.get("until", 0) > now else None,
-                "subs": subs_text(subs, now) if (subs.get("live") or not final) and subs else "",
+                "sub_lines": sub_lines, "subs_done": sub_done,
                 "subs_live": len(subs.get("live") or {}),
                 "inbox": inbox_line(inbox, now) if inbox else "",
                 "stalled": int(idle_for) if stalled else 0}
@@ -3192,6 +3349,202 @@ class Bridge(discord.Client):
         if st is not None and not still:
             st.pop("prompt_msg", None)
             save_state()
+
+    # ---------- per-project channels ----------
+
+    async def parent_for(self, s):
+        """The project channel a newly found session's thread belongs in, or None (#claudes)."""
+        cid, _ = project_for_cwd(s.get("cwd"))
+        if not cid:
+            return None
+        ch = await self.get_thread(int(cid))
+        return ch if isinstance(ch, discord.TextChannel) else None
+
+    async def project_prompt(self, msg, pr, prompt, harness=None, worktree=None):
+        """A plain message (or voice note) in a project channel starts a session in its directory
+        with the project's harness; its thread hangs off the message."""
+        if pr.get("archived"):
+            return await self.say(msg.channel, "-# 🗄️ this project is archived — `/unarchive` it to start sessions")
+        harness = harness or pr.get("harness", "claude")
+        wt = pr.get("worktrees") if worktree is None else worktree
+        cwd = Path(pr["dir"])
+        if not cwd.is_dir():
+            return await self.say(msg.channel, f"⚠️ `{cwd}` doesn't exist anymore — `/project` to point this channel elsewhere")
+        if harness == "codex":
+            if wt:
+                try:
+                    cwd = await asyncio.to_thread(worktrees.create_worktree, cwd, str(msg.channel.id))
+                except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                    await self.say(msg.channel, f"-# ⚠️ no worktree ({e}) — starting in `{cwd}`")
+            attached = await self.save_attachments(msg)
+            payload = f"{prompt}\n{attached}".strip() if attached else prompt
+            await msg.add_reaction("🛰️")
+            return await self.astra_start(msg.channel, msg.author, str(cwd), payload,
+                                          lambda t: self.say(msg.channel, t), title=slug(prompt or "codex", 40))
+        return await self.summon(msg, prompt, cwd=cwd, project=str(msg.channel.id), worktree=wt)
+
+    async def create_project(self, channel, user, name, dir_text, harness, respond):
+        if not self.privileged(user):
+            return await respond("🔐 creating project channels is owner-only")
+        d = resolve_dir(dir_text)
+        if not d:
+            return await respond(f"❌ `{dir_text}` isn't a directory on this machine (relative paths are under "
+                                 f"`{PROJECT_ROOT}`)")
+        harness = (harness or "claude").lower()
+        if harness not in HARNESSES:
+            return await respond(f"harness: {', '.join(HARNESSES)}")
+        cname = re.sub(r"[^a-z0-9_-]+", "-", (name or d.name).lower()).strip("-")[:90] or "project"
+        for cid, pr in projects().items():
+            if pr["dir"] == str(d) or pr["name"] == cname:
+                return await respond(f"📁 already a project: <#{cid}> → `{pr['dir']}`")
+        guild = self.main_channel.guild if self.main_channel else None
+        if guild is None:
+            return await respond("❌ the bridge isn't connected to a server yet")
+        pr = {"name": cname, "dir": str(d), "harness": harness, "worktrees": False, "archived": False,
+              "created_by": getattr(user, "id", None), "created_at": time.time()}
+        try:
+            ch = await guild.create_text_channel(cname, category=self.main_channel.category, topic=project_topic(pr))
+        except discord.HTTPException as e:
+            return await respond(f"❌ couldn't create the channel (the bot needs Manage Channels): `{e}`")
+        projects()[str(ch.id)] = pr
+        save_state()
+        await self.say(ch, f"📁 **{cname}** → `{d}`\nType a prompt here to start a **{harness}** session in that "
+                           "directory; voice messages work too. Sessions already running there get their "
+                           "threads here from now on.\n-# `/harness` claude/codex · `/worktrees` on/off · "
+                           "`/archive` · `/claude` and `/astra` also work here")
+        await respond(f"📁 created <#{ch.id}> for `{d}`")
+
+    async def project_command(self, msg, pr, content):
+        """`!harness <claude|codex>`, `!worktrees [on|off]`, `!archive`, `!unarchive`, `!project` in a
+        project channel. Returns False if `content` isn't one of them."""
+        low = content.lower().split()
+        cmd, arg = low[0], (low[1] if len(low) > 1 else "")
+        say = lambda t: self.say(msg.channel, t)  # noqa: E731
+        if cmd == "!project":
+            return await say(f"📁 **{pr['name']}** → `{pr['dir']}` · new sessions: **{pr.get('harness', 'claude')}**"
+                             f"{' in a fresh worktree' if pr.get('worktrees') else ''}"
+                             f"{' · 🗄️ archived' if pr.get('archived') else ''}") or True
+        if cmd == "!harness":
+            return await self.set_project_option(msg.channel, msg.author, "harness", arg, say) or True
+        if cmd == "!worktrees":
+            return await self.set_project_option(msg.channel, msg.author, "worktrees", arg, say) or True
+        if cmd in ("!archive", "!unarchive"):
+            return await self.archive_project(msg.channel, msg.author, cmd == "!archive", say) or True
+        return False
+
+    async def set_project_option(self, channel, user, opt, value, respond):
+        pr = project_for_channel(channel.id)
+        if not pr:
+            return await respond("run this in a project channel (`/project` makes one)")
+        if opt == "harness":
+            if value not in HARNESSES:
+                return await respond(f"📁 new sessions here use **{pr.get('harness', 'claude')}** · "
+                                     f"`/harness name:<{'|'.join(HARNESSES)}>`")
+            pr["harness"] = value
+        else:
+            if value in ("", "status"):
+                return await respond(f"🌿 worktrees for new sessions: **{'on' if pr.get('worktrees') else 'off'}**")
+            if value in ("on", "true", "yes", "1"):
+                try:
+                    await asyncio.to_thread(worktrees.validate_repository, pr["dir"])
+                except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                    return await respond(f"❌ `{pr['dir']}` can't do worktrees: {e}")
+                pr["worktrees"] = True
+            elif value in ("off", "false", "no", "0"):
+                pr["worktrees"] = False
+            else:
+                return await respond("`/worktrees enabled:True|False`")
+        save_state()
+        try:
+            await channel.edit(topic=project_topic(pr))
+        except discord.HTTPException:
+            pass
+        await respond(f"📁 **{pr['name']}**: new sessions use **{pr.get('harness', 'claude')}**"
+                      + (", each in a fresh git worktree (branch `chert/<id>` from HEAD; uncommitted changes "
+                         "aren't copied)" if pr.get("worktrees") else ", in the project directory"))
+
+    async def archive_project(self, channel, user, archive, respond, name=None):
+        if not self.privileged(user):
+            return await respond("🔐 owner-only")
+        cid, pr = ((next(((c, p) for c, p in projects().items() if p["name"] == name), (None, None)))
+                   if name else (str(channel.id), project_for_channel(channel.id)))
+        if not pr:
+            return await respond("no such project" if name else "run this in a project channel, or give its name")
+        ch = await self.get_thread(int(cid))
+        guild = self.main_channel.guild
+        try:
+            if archive:
+                cat = discord.utils.get(guild.categories, name=ARCHIVE_CATEGORY) or \
+                    await guild.create_category(ARCHIVE_CATEGORY)
+                await ch.edit(category=cat)
+            else:
+                await ch.edit(category=self.main_channel.category)
+        except (discord.HTTPException, AttributeError) as e:
+            return await respond(f"❌ couldn't move the channel: `{e}`")
+        pr["archived"] = archive
+        save_state()
+        try:
+            await ch.edit(topic=project_topic(pr))
+        except discord.HTTPException:
+            pass
+        await respond(f"🗄️ archived **{pr['name']}** — running sessions can finish; new prompts are refused"
+                      if archive else f"📁 **{pr['name']}** is back")
+
+    # ---------- voice messages ----------
+
+    def vocabulary(self):
+        """Names Whisper should expect: live sessions, projects, project directories."""
+        names = [v.get("name") for v in sessions_state().values() if not v.get("ended")]
+        for pr in projects().values():
+            names += [pr["name"], Path(pr["dir"]).name]
+        return [n for n in names if n][:60]
+
+    def wants_audio(self, msg):
+        ch = msg.channel
+        if isinstance(ch, discord.Thread):
+            return ch.id in thread_to_key() or str(ch.id) in state.get("_astra", {})
+        return (ch.id in (CHANNEL_ID, getattr(self.broadcast_channel, "id", None),
+                          getattr(self.chat_channel, "id", None))
+                or project_for_channel(ch.id) is not None or self.user in msg.mentions)
+
+    async def prepare_audio(self, msg):
+        """Transcribe a message's voice/audio attachments, post the transcript under it, and return
+        a stand-in message whose text is caption + transcript (None if nothing was heard)."""
+        audios = [a for a in msg.attachments if voice.is_audio(a)]
+        others = [a for a in msg.attachments if a not in audios]
+        try:
+            await msg.add_reaction("🎙️")
+        except discord.HTTPException:
+            pass
+        texts = []
+        for a in audios[:3]:
+            try:
+                text, secs, lang = await voice.transcribe_attachment(a, self.vocabulary())
+                print(f"transcribed {a.filename} ({secs:.0f}s, {lang}) from {msg.author}", flush=True)
+            except Exception as e:  # noqa: BLE001 — a bad clip must not swallow the message
+                log_error("transcribe", e)
+                await msg.reply(f"-# 🎙️ couldn't transcribe `{a.filename}`: {e}", allowed_mentions=NO_PING,
+                                mention_author=False)
+                continue
+            if text:
+                texts.append(text)
+        try:
+            await msg.remove_reaction("🎙️", self.user)
+        except discord.HTTPException:
+            pass
+        caption = (msg.content or "").strip()
+        transcript = "\n".join(texts).lstrip("!/ ")     # a transcript is a prompt, never a bot command
+        if not transcript and not caption and not others:
+            await msg.reply("-# 🎙️ heard nothing in that", allowed_mentions=NO_PING, mention_author=False)
+            return None
+        if transcript:
+            for i, chunk in enumerate(split_chunks(f"🎙️ **{msg.author.display_name}:** {transcript}")):
+                try:
+                    await (msg.reply(chunk, allowed_mentions=NO_PING, mention_author=False) if i == 0
+                           else msg.channel.send(chunk, allowed_mentions=NO_PING))
+                except discord.HTTPException as e:
+                    log_error("transcript post", e)
+        return _AudioMsg(msg, "\n".join(x for x in (caption, transcript) if x), others)
 
     # ---------- activity-card controls ----------
 
@@ -3355,9 +3708,12 @@ class Bridge(discord.Client):
         archive their thread, and leave a silent ♻️ Resurrect button there. Busy / shell / waiting
         sessions, ones with subagents still running, ctrl-z'd ones and the #all-claudes hub are
         never touched; a /loop cron keeps its session's transcript fresh, so it never qualifies."""
-        if IDLE_SHUTDOWN_DAYS <= 0 or time.time() - self._last_idle_check < 600:
+        if time.time() - self._last_idle_check < 600:
             return
         self._last_idle_check = time.time()
+        voice.maybe_unload()
+        if IDLE_SHUTDOWN_DAYS <= 0:
+            return
         cutoff = time.time() - IDLE_SHUTDOWN_DAYS * 86400
         live = {x["key"]: x for x in await asyncio.to_thread(live_sessions)}
         done = 0
@@ -3879,14 +4235,27 @@ class Bridge(discord.Client):
                 f"-# usual causes: a login screen, a missing/invalid API key, or `claude` not on "
                 f"PATH. Attach with `tmux select-window -t {pane}`")
 
-    async def summon(self, msg, prompt_text):
-        """@mention -> spawn a fresh claude and open its thread on the summoning message."""
+    async def summon(self, msg, prompt_text, cwd=None, project=None, worktree=None):
+        """@mention (or a prompt in a project channel, or a voice message in #claudes) -> spawn a
+        fresh claude and open its thread on that message. Without `cwd` the first word may
+        name a project dir. `project` = the project channel id; `worktree` = start it in a
+        fresh git worktree of cwd's repo."""
         if SPAWN_ALLOW_USERS and msg.author.id not in SPAWN_ALLOW_USERS:
             await msg.reply("⛔ you're not on the spawn allowlist (SPAWN_ALLOW_USERS)",
                             allowed_mentions=NO_PING)
             return
-        cwd, words = resolve_project(prompt_text.split())
-        prompt = " ".join(words).strip()
+        if cwd is None:
+            cwd, words = resolve_project(prompt_text.split())
+            prompt = " ".join(words).strip()
+        else:
+            prompt = prompt_text.strip()
+        wt_note = ""
+        if worktree:
+            try:
+                cwd = await asyncio.to_thread(worktrees.create_worktree, cwd, project or "adhoc")
+                wt_note = f"🌿 fresh worktree `{cwd}`"
+            except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                await msg.reply(f"-# ⚠️ no worktree ({e}) — starting in `{cwd}` instead", allowed_mentions=NO_PING)
         attached = await self.save_attachments(msg)
         if not prompt and not attached:
             await msg.reply(
@@ -3912,13 +4281,13 @@ class Bridge(discord.Client):
             id=msg.channel.id,
             create_thread=lambda name, auto_archive_duration, **_: msg.create_thread(
                 name=name, auto_archive_duration=auto_archive_duration))
-        thread = await self.adopt_session(session, on_msg, {"spawned": True})
+        thread = await self.adopt_session(session, on_msg, {"spawned": True, **({"project": project} if project else {})})
         if not thread:
             await msg.reply("⚠️ launched but couldn't open a thread — the poller will pick it up",
                             allowed_mentions=NO_PING)
             return
-        if notes:
-            await self.say(thread, "\n".join(f"-# 🛠 {n}" for n in notes))
+        if notes or wt_note:
+            await self.say(thread, "\n".join(f"-# 🛠 {n}" for n in notes) + (f"\n-# {wt_note}" if wt_note else ""))
         payload = f"{prompt}\n{attached}".strip() if attached else prompt
         entry = self.track_inbox(key, msg, payload)
         ok, serr = await asyncio.to_thread(self.deliver, session, msg.author, payload)
@@ -5209,16 +5578,31 @@ class Bridge(discord.Client):
                                      " ".join(rest).strip() or prompt, followup(interaction))
         @tree.command(name="claude", description="Launch a new claude here and open its thread")
         @discord.app_commands.describe(prompt="what it should do (first word may name a project dir)",
-                                       project="project dir under PROJECT_ROOT (optional)")
-        async def claude_cmd(interaction: discord.Interaction, prompt: str, project: str = ""):
+                                       project="project dir under PROJECT_ROOT (optional)",
+                                       worktree="start it in a fresh git worktree (default: the project "
+                                                "channel's setting, else no)")
+        async def claude_cmd(interaction: discord.Interaction, prompt: str, project: str = "",
+                             worktree: typing.Optional[bool] = None):
             if SPAWN_ALLOW_USERS and interaction.user.id not in SPAWN_ALLOW_USERS:
                 return await interaction.response.send_message(
                     "⛔ you're not on the spawn allowlist (SPAWN_ALLOW_USERS)", ephemeral=True)
             await interaction.response.defer(thinking=True)
             respond = followup(interaction)
-            words = (f"{project} {prompt}" if project else prompt).split()
-            cwd, rest = resolve_project(words)
-            text = " ".join(rest).strip() or prompt
+            here = interaction.channel.parent if isinstance(interaction.channel, discord.Thread) else interaction.channel
+            pcid = str(getattr(here, "id", ""))
+            pr = project_for_channel(pcid) if pcid else None
+            if pr and not project:
+                cwd, text = Path(pr["dir"]), prompt               # in a project channel: its directory
+            else:
+                words = (f"{project} {prompt}" if project else prompt).split()
+                cwd, rest = resolve_project(words)
+                text = " ".join(rest).strip() or prompt
+                pr = None
+            if worktree or (worktree is None and pr and pr.get("worktrees")):
+                try:
+                    cwd = await asyncio.to_thread(worktrees.create_worktree, cwd, pcid if pr else "adhoc")
+                except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                    await respond(f"-# ⚠️ no worktree ({e}) — starting in `{cwd}`")
             pane, err = await asyncio.to_thread(spawn_claude, slug(text, 32), cwd)
             if not pane:
                 return await respond(f"❌ couldn't launch: `{err}`")
@@ -5227,7 +5611,8 @@ class Bridge(discord.Client):
                 return await respond(await bridge.spawn_failure_text(pane, cwd, notes))
             parent = (interaction.channel.parent if isinstance(interaction.channel, discord.Thread)
                       else interaction.channel) or bridge.main_channel
-            thread = await bridge.adopt_session(session, parent, {"spawned": True})
+            thread = await bridge.adopt_session(session, parent,
+                                                {"spawned": True, **({"project": pcid} if pr else {})})
             ok, serr = await asyncio.to_thread(bridge.deliver, session, interaction.user, text)
             print(f"/claude by {interaction.user} ({interaction.user.id}) -> {cwd} pane {pane} "
                   f"key {session['key']} ok={ok} gates={notes}")
@@ -5247,6 +5632,50 @@ class Bridge(discord.Client):
             await interaction.response.defer(thinking=True)
             await bridge.feldspar(interaction.channel, interaction.user, target, focus2,
                                   followup(interaction))
+
+        @tree.command(name="project", description="Make a channel for a directory; a prompt there starts a "
+                                                  "session in it (no args: show)")
+        @discord.app_commands.describe(name="channel name (default: the directory's name)",
+                                       dir="the directory: absolute, ~/…, or relative to PROJECT_ROOT",
+                                       harness="what a plain prompt starts there (default claude)")
+        @discord.app_commands.choices(harness=[Choice(name=h, value=h) for h in HARNESSES])
+        async def project_cmd(interaction: discord.Interaction, dir: str = "", name: str = "", harness: str = "claude"):
+            await interaction.response.defer(thinking=True)
+            respond = followup(interaction)
+            if not dir:
+                pr = project_for_channel(interaction.channel_id)
+                if pr:
+                    return await respond(f"📁 **{pr['name']}** → `{pr['dir']}` · new sessions: "
+                                         f"**{pr.get('harness', 'claude')}**{' in a fresh worktree' if pr.get('worktrees') else ''}")
+                rows = [f"<#{c}> → `{p['dir']}` · {p.get('harness', 'claude')}{' · 🗄️' if p.get('archived') else ''}"
+                        for c, p in projects().items()]
+                return await respond("📁 projects:\n" + "\n".join(rows) if rows else
+                                     "no project channels yet — `/project dir:<path>` makes one")
+            await bridge.create_project(interaction.channel, interaction.user, name, dir, harness, respond)
+
+        @tree.command(name="harness", description="What a plain prompt in this project channel starts: claude or codex")
+        @discord.app_commands.choices(name=[Choice(name=h, value=h) for h in HARNESSES])
+        async def harness_cmd(interaction: discord.Interaction, name: str = ""):
+            await interaction.response.defer(thinking=True)
+            await bridge.set_project_option(interaction.channel, interaction.user, "harness", name, followup(interaction))
+
+        @tree.command(name="worktrees", description="Start each new session in this project in a fresh git worktree")
+        async def worktrees_cmd(interaction: discord.Interaction, enabled: typing.Optional[bool] = None):
+            await interaction.response.defer(thinking=True)
+            val = "" if enabled is None else ("on" if enabled else "off")
+            await bridge.set_project_option(interaction.channel, interaction.user, "worktrees", val, followup(interaction))
+
+        @tree.command(name="archive", description="Move this project channel to the archived section")
+        @discord.app_commands.default_permissions(administrator=True)
+        async def archive_cmd(interaction: discord.Interaction, name: str = ""):
+            await interaction.response.defer(thinking=True)
+            await bridge.archive_project(interaction.channel, interaction.user, True, followup(interaction), name or None)
+
+        @tree.command(name="unarchive", description="Move a project channel back from the archived section")
+        @discord.app_commands.default_permissions(administrator=True)
+        async def unarchive_cmd(interaction: discord.Interaction, name: str = ""):
+            await interaction.response.defer(thinking=True)
+            await bridge.archive_project(interaction.channel, interaction.user, False, followup(interaction), name or None)
 
         @tree.command(name="sessions", description="Every live claude as a clickable thread link")
         async def sessions_cmd(interaction: discord.Interaction):
@@ -5925,6 +6354,12 @@ class Bridge(discord.Client):
         # and blanket-ignoring `author.bot` made them invisible to every claude.
         if msg.author.id == self.user.id or msg.webhook_id:
             return
+        # voice messages / audio uploads become text (transcribed on this machine) before routing
+        if msg.attachments and voice.available() and any(voice.is_audio(a) for a in msg.attachments) \
+                and self.wants_audio(msg):
+            msg = await self.prepare_audio(msg)
+            if msg is None:
+                return
         content = (msg.content or "").strip()
         # @mention in ANY non-thread channel -> summon a brand new claude there
         if self.user in msg.mentions and not isinstance(msg.channel, discord.Thread):
@@ -5942,7 +6377,18 @@ class Bridge(discord.Client):
                 await asyncio.to_thread(bus_append, msg.author.display_name, content)
                 await msg.add_reaction("📨")
             return
+        pr = None if isinstance(msg.channel, discord.Thread) else project_for_channel(msg.channel.id)
+        if pr is not None:
+            # a project channel: plain text starts a session there; !commands configure it
+            if content.startswith("!"):
+                if not await self.project_command(msg, pr, content):
+                    await self.handle_main_command(msg, content)
+            elif content or msg.attachments:
+                await self.project_prompt(msg, pr, content)
+            return
         if msg.channel.id == CHANNEL_ID:
+            if getattr(msg, "transcribed", False) and content and not content.startswith("!"):
+                return await self.summon(msg, content)    # a voice note in #claudes starts a session
             fm = FELDSPAR_RE.match(content)
             if fm:
                 target, focus, err = await self.feldspar_target(msg.channel, fm.group("focus"))

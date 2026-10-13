@@ -23,6 +23,15 @@ writes, receives Claude Code hook events, and types into sessions through tmux.
   tool counts, elapsed time, the model, the permission mode, and whether fast mode is on and
   actually being served. Buttons under it interrupt the turn, interrupt and send a message, show
   the screen, toggle fast mode and yolo, and (when it stops making progress) unstick it.
+- Running subagents are listed on the card with their description, age, tool count and the
+  command each one is running right now. Background subagents that outlive the turn keep a line
+  of their own.
+- Voice messages and audio files work as prompts anywhere you can type one. They're transcribed on
+  the machine itself (faster-whisper, no API key), and the transcript is posted under your message.
+- Project channels (optional): `/project dir:~/code/foo` makes `#foo`. A plain message there
+  starts a session in that directory, with Claude or Codex (`/harness`), optionally each in a
+  fresh git worktree (`/worktrees`). Sessions running in that directory get their threads there;
+  everything else stays in `#claudes`.
 - Reactions on your messages show where each one is: 📨 typed in, ⏳ queued behind the running
   turn, 👀 read by Claude, ✅ answered, ⚠️ stuck in the input box.
 - Permission prompts and menus appear as buttons.
@@ -97,9 +106,13 @@ Anywhere:
 
 | Command | What it does |
 |---|---|
-| `/claude <prompt> [project]` | Start a new session and open its thread. `project` is a directory under `PROJECT_ROOT`. |
+| `/claude <prompt> [project] [worktree]` | Start a new session and open its thread. `project` is a directory under `PROJECT_ROOT`; in a project channel it defaults to that project. `worktree` starts it in a fresh git worktree. |
 | `/resume <session>` | Search every session the machine has had (with autocomplete) and bring one back into a thread. |
 | `/sessions` | List live sessions with links to their threads. |
+| `/project [dir] [name] [harness]` | Make a channel for a directory. A plain message there starts a session in it. With no arguments, shows the project (or lists them all). Owner only. |
+| `/harness <claude\|codex>` | In a project channel: what a plain message starts. |
+| `/worktrees [enabled]` | In a project channel: start each new session in a fresh git worktree (a `chert/<id>` branch from the committed `HEAD`; uncommitted changes aren't copied). |
+| `/archive [name]`, `/unarchive [name]` | Move a project channel into or out of the `archived projects` category. Archived projects refuse new prompts. |
 | `/astra <prompt> [project]` | Start a GPT session in its own thread. See [Astra](#astra). |
 | `/globalmodel <name>` | Switch every live session to a model, and make it the default for new ones. Owner only. |
 | `/help` | List all commands. |
@@ -186,6 +199,8 @@ defaults; `setup.sh` fills in the Discord ones. Settings you may want to change:
 | `DISCORD_OWNER_ID` | the server owner | Who gets pinged and who can use `/model` and `/globalmodel`. |
 | `REPORTS_URL` | none | A web server that serves `REPORTS_DIR`. Without it, reports are linked by file path. |
 | `S3_BUCKET` | none | Turns on backups and offloading. |
+| `AUDIO_MODEL` | `small` | The Whisper model for voice messages (`base` is faster, `medium`/`turbo` more accurate). `AUDIO_TRANSCRIBE=0` turns transcription off. |
+| `WORKTREE_ROOT` | `~/.chert/worktrees` | Where session worktrees are created. |
 | `IDLE_SHUTDOWN_DAYS` | `3` | Shut down sessions unused for this long (`0` turns it off). |
 | `UNSTICK_MODE` | `bypassPermissions` | The permission mode `/refresh` restarts a stuck session in. |
 
