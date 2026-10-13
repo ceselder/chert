@@ -18,8 +18,13 @@ writes, receives Claude Code hook events, and types into sessions through tmux.
 
 - Every Claude Code session on the machine gets a thread in `#claudes`. The session's replies are
   posted there, and anything you write in the thread is typed into the session.
-- While a session is working, one message per turn is edited in place with the current step, the
-  command it's running, its latest thought, tool counts, elapsed time and the model.
+- While a session is working, one message per turn is edited in place: the current step, the
+  command it's running, whether it is thinking right now, its latest thought, running subagents,
+  tool counts, elapsed time, the model, the permission mode, and whether fast mode is on and
+  actually being served. Buttons under it interrupt the turn, interrupt and send a message, show
+  the screen, toggle fast mode and yolo, and (when it stops making progress) unstick it.
+- Reactions on your messages show where each one is: 📨 typed in, ⏳ queued behind the running
+  turn, 👀 read by Claude, ✅ answered, ⚠️ stuck in the input box.
 - Permission prompts and menus appear as buttons.
 - Slash commands start, fork, rename and unstick sessions, and change their model, effort or
   permission mode.
@@ -27,6 +32,10 @@ writes, receives Claude Code hook events, and types into sessions through tmux.
   replies and posts one answer.
 - Images a session opens are posted to its thread. `hearth-send <file>` posts any other file.
 - After a reboot, sessions that were running come back in their old threads.
+- A session nobody has used for 3 days is shut down (history kept). Its thread gets a ♻️ Resurrect
+  button, which doesn't ping you.
+- If the bot itself gets stuck, a watchdog restarts it. If restarting doesn't help, the watchdog
+  starts a Claude session in bypass mode to fix it.
 - Optional: code review by a Claude and a GPT reviewer (Feldspar), GPT sessions as threads
   (Astra), S3 backups, and a web dashboard.
 
@@ -65,7 +74,9 @@ In a session's thread:
 
 | Command | What it does |
 |---|---|
-| `/refresh [message] [force]` | Unstick the session. Sends Esc first and restarts the session in place (history kept) only if it stays stuck. `message` is sent once it responds. If the session is idle and was active in the last five minutes, it isn't treated as stuck: only `message` is sent, unless `force` is set. |
+| `/refresh [message] [force]` | Unstick the session. Sends Esc first. If it stays stuck, restarts the session in place (history kept) in bypass mode, so auto-mode classifier blocks can't wedge it again (`/mode auto` turns the classifier back on). `message` is sent once it responds. If the session is idle and was active in the last five minutes, it isn't treated as stuck: only `message` is sent, unless `force` is set. |
+| `/stop` | Interrupt the running turn (the terminal's Esc). |
+| `/yolo [duration] [everywhere]` | Turn permission checks off for this session for a while (`30m`, default `1h`, at most `12h`), then switch back to the mode it had. `off` ends it early. `everywhere` instead applies to every session started in that window. Owner only. |
 | `/screen` | Show the terminal screen. |
 | `/key <key>` | Press a key: `esc`, `enter`, arrow keys, `tab`, `shift-tab`, `space`, `pgup`, `pgdn`, `1`–`9`. |
 | `/fork [message] [to]` | Copy the session and its history into a new session with its own thread. With `to: astra`, the conversation goes to a GPT session instead. |
@@ -91,7 +102,6 @@ Anywhere:
 | `/sessions` | List live sessions with links to their threads. |
 | `/astra <prompt> [project]` | Start a GPT session in its own thread. See [Astra](#astra). |
 | `/globalmodel <name>` | Switch every live session to a model, and make it the default for new ones. Owner only. |
-| `/yolo <duration>` | Start new sessions with permission checks off for a while (`30m`, `1h`, at most `12h`), or `off`. |
 | `/help` | List all commands. |
 
 For all sessions at once (the output is posted in `#claudes`):
@@ -109,7 +119,7 @@ For all sessions at once (the output is posted in `#claudes`):
 
 In `#all-claudes`, `/hub <message>` talks to the summarizer directly (see [Channels](#channels)).
 
-`/model`, `/globalmodel` and `/fast` only work for the owner (`DISCORD_OWNER_ID`, or the server owner).
+`/model`, `/globalmodel`, `/fast` and `/yolo` only work for the owner (`DISCORD_OWNER_ID`, or the server owner).
 Discord shows `/model`, `/globalmodel`, `/fast`, `/yolo`, `/restartall`, `/cleanup`, `/offload` and
 `/restore` only to admins unless you change that in the server's integration settings.
 
@@ -176,11 +186,21 @@ defaults; `setup.sh` fills in the Discord ones. Settings you may want to change:
 | `DISCORD_OWNER_ID` | the server owner | Who gets pinged and who can use `/model` and `/globalmodel`. |
 | `REPORTS_URL` | none | A web server that serves `REPORTS_DIR`. Without it, reports are linked by file path. |
 | `S3_BUCKET` | none | Turns on backups and offloading. |
+| `IDLE_SHUTDOWN_DAYS` | `3` | Shut down sessions unused for this long (`0` turns it off). |
+| `UNSTICK_MODE` | `bypassPermissions` | The permission mode `/refresh` restarts a stuck session in. |
 
 ## Running it
 
 - `setup.sh` installs three services: `chert-tmux`, `chert-discord-bridge`, and `chert-checkin`
   (the dashboard, on `127.0.0.1:8899`). To follow the bot's log: `journalctl -u chert-discord-bridge -f`.
+- It also installs `chert-watchdog.timer`, which runs `bin/chert-watchdog` every 2 minutes. The bot
+  rewrites `~/.claude/chert-heartbeat` every few seconds. If that file is more than 6 minutes old,
+  the watchdog restarts the bot. If two restarts in an hour don't help (or the service has
+  failed), it starts a Claude session named `chert-fixer` in tmux with permission checks off and
+  tells it to find and fix the problem. It commits the fix but doesn't push. You're pinged when a
+  fixer starts. `bin/chert-watchdog --status` shows what the watchdog sees, and creating
+  `~/.claude/chert-watchdog.pause` turns it off. It leaves a service alone after you stop it
+  with `systemctl stop`.
 - To update: `git pull && sudo systemctl restart chert-discord-bridge`. Running sessions are not
   affected, but an Astra turn or the GPT half of a Feldspar review that is in progress is stopped.
 - The dashboard has no login and can type into sessions. Keep it on localhost, or put it behind

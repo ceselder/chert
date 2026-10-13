@@ -1,0 +1,13 @@
+[Unit]
+Description=chert: watchdog — restart a wedged Discord bridge, call a fixer claude if that doesn't help
+After=chert-discord-bridge.service
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+WorkingDirectory=@APP@
+EnvironmentFile=@APP@/.env
+Environment=CHERT_UNIT=chert-discord-bridge
+Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 @APP@/bin/chert-watchdog

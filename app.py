@@ -427,12 +427,16 @@ def parse_transcript(path, from_byte=0, tail=TAIL_BYTES, raw=False):
             # the model that produced this turn — surfaced so the bridge can show which model is
             # running and flag when the auto-mode classifier reroutes a turn to another model
             model = (r.get("message") or {}).get("model")
+            # what the API actually served ("fast" / "standard"); the ↯ fast-mode toggle being on
+            # does not guarantee fast output
+            speed = ((r.get("message") or {}).get("usage") or {}).get("speed")
             for blk in (r.get("message") or {}).get("content") or []:
                 if not isinstance(blk, dict):
                     continue
                 bt = blk.get("type")
                 if bt == "text" and blk.get("text", "").strip():
-                    items.append({"kind": "assistant", body: fmt(blk["text"]), "ts": ts, "model": model})
+                    items.append({"kind": "assistant", body: fmt(blk["text"]), "ts": ts, "model": model,
+                                  "speed": speed})
                 elif bt == "thinking" and blk.get("thinking", "").strip():
                     items.append({"kind": "thinking",
                                   body: esc(blk["thinking"][:3000]), "ts": ts, "model": model})
@@ -442,9 +446,11 @@ def parse_transcript(path, from_byte=0, tail=TAIL_BYTES, raw=False):
                     # the tool's own description is what Claude Code's spinner shows as the
                     # headline ("Adding log-spaced saves…"), with the command beneath it
                     desc = (blk.get("input") or {}).get("description")
+                    sub = (blk.get("input") or {}).get("subagent_type")
                     items.append({"kind": "tool", "name": name, body: esc(summ),
                                   "desc": esc(desc.strip()[:200]) if isinstance(desc, str) else "",
-                                  "ts": ts, "model": model})
+                                  "sub": sub if isinstance(sub, str) else "",
+                                  "ts": ts, "model": model, "speed": speed})
         elif t == "user":
             msg = (r.get("message") or {})
             c = msg.get("content")
@@ -473,6 +479,12 @@ def parse_transcript(path, from_byte=0, tail=TAIL_BYTES, raw=False):
                                           "name": tool_names.get(blk.get("tool_use_id", ""), ""),
                                           "error": bool(blk.get("is_error")),
                                           body: esc(tx[:2500]), "ts": ts})
+        elif t == "queue-operation" and raw:
+            # Claude Code's own record of a message typed while it was busy: "enqueue" (waiting
+            # for the turn), then "remove"/"dequeue" once the model actually takes it in. The
+            # bridge turns this into read receipts on the Discord message.
+            items.append({"kind": "queue", "op": r.get("operation") or "", "reason": r.get("reason") or "",
+                          "text": r.get("content") if isinstance(r.get("content"), str) else "", "ts": ts})
         elif t == "system" and r.get("subtype") == "local_command":
             cm = CMD_RE.search(r.get("content", ""))
             if cm:

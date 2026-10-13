@@ -6,6 +6,10 @@ __pycache__/
 CLIENT-SETUP.txt
 bot_state.json.bak
 bot_state.json.tmp
+bot_state.json.lock
+# hand-made state backups (bot_state.json.pre-*, bot_state.before-*.json)
+bot_state.json.*
+bot_state.*.json
 .claude/
 systemd/rendered/
 

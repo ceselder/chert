@@ -42,6 +42,7 @@ optional DISCORD_CHAT_CHANNEL_ID (default: find-or-create #claude-chat),
 DISCORD_OWNER_ID (defaults to guild owner), POLL_SECS (default 4). See .env.example.
 """
 import asyncio
+import fcntl
 import json
 import os
 import re
@@ -52,6 +53,7 @@ import struct
 import subprocess
 import sys
 import time
+import types
 import urllib.parse
 from collections import Counter, deque
 from pathlib import Path
@@ -111,6 +113,15 @@ SPAWN_TIMEOUT = 75
 # Ended sessions stay in state this long so `!revive` in their thread keeps working
 # across bridge restarts (they used to be dropped at every startup).
 ENDED_KEEP_DAYS = float(os.environ.get("ENDED_KEEP_DAYS", "14"))
+# A live claude nobody has used in this many days is shut down cleanly (history kept); its
+# thread gets a silent ♻️ Resurrect button. 0 turns it off.
+IDLE_SHUTDOWN_DAYS = float(os.environ.get("IDLE_SHUTDOWN_DAYS", "3"))
+# A busy claude with no new transcript output (and no tool still running) for this long gets a
+# "no progress" warning and an Unstick button on its activity card.
+STALL_SECS = int(os.environ.get("STALL_SECS", "300"))
+# Touched at the end of every poll loop. bin/chert-watchdog (systemd timer) restarts the
+# bridge when it goes stale, and spawns a fixer claude if restarting doesn't help.
+HEARTBEAT_FILE = Path(os.environ.get("HEARTBEAT_FILE", str(Path.home() / ".claude" / "chert-heartbeat")))
 # After a reboot every session that was live is resumed into tmux, history intact.
 REVIVE_ON_BOOT = os.environ.get("REVIVE_ON_BOOT", "1") == "1"
 # A session that vanished without a clean exit (crash/OOM/kill -9) is resumed too.
@@ -290,17 +301,18 @@ KEYMAP = {"esc": "Escape", "escape": "Escape", "enter": "Enter", "up": "Up",
 HELP = ("🔭 **chert** — every Claude Code session on this box has a thread in #claudes. "
         "Write in a thread to type into that session; permission prompts arrive as buttons.\n"
         "\n**In a session's thread**\n"
-        "`/refresh [message]` unstick it: Esc first, restart in place only if still stuck\n"
+        "`/refresh [message]` unstick it: Esc first, then restart in place in bypass · `/stop` interrupt\n"
         "`/screen` show the terminal · `/key <key>` press esc, enter, arrows, tab, 1–9\n"
         "`/fork [message] [to]` copy it into a new session (`to: astra` hands it to GPT)\n"
         "`/rename` · `/effort` · `/model` (owner) · `/fast [on|off]` (owner) · `/mode` (`bypass` = classifier off)\n"
+        "`/yolo [1h|off]` this session in bypass for a while, then back (owner)\n"
         "`/restart [force]` restart in place · `/revive [mode]` bring back an ended session\n"
         "`/log [count]` timeline · `/mute` · `/unmute` · `/supernova` countdown to wrap-up\n"
         "`/kill [how]` end it · `/feldspar [focus]` Claude + GPT code review\n"
         "\n**Anywhere**\n"
         "`/claude <prompt>` start a session · `/resume <session>` bring back any past one\n"
         "`/sessions` list live sessions · `/astra <prompt>` a GPT session as a thread\n"
-        "`/globalmodel` · `/fast on everywhere` every session (owner) · `/yolo <30m|1h|off>` bypass for new sessions\n"
+        "`/globalmodel` · `/fast on everywhere` every session (owner) · `/yolo 1h everywhere` bypass for new sessions\n"
         "\n**Fleet** (output goes to #claudes)\n"
         "`/all <message>` send to every session · `/restartall` · `/reviveall` · `/cleanup`\n"
         "`/disk` · `/backup` · `/offload <dir>` · `/restore <dir>` · `/s3` (S3 needs S3_BUCKET)\n"
@@ -485,6 +497,24 @@ def iso_to_unix(ts):
         return None
 
 
+def transcript_last_ts(path, nbytes=256 * 1024):
+    """Unix time of the newest timestamped line in a transcript (0 if unknown)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - nbytes))
+            lines = f.read().splitlines()
+    except (OSError, TypeError):
+        return 0
+    for line in reversed(lines):
+        try:
+            ts = json.loads(line).get("timestamp")
+        except (ValueError, AttributeError):
+            continue
+        if ts:
+            return iso_to_unix(ts) or 0
+    return 0
+
+
 def render_ship_log(name, entries):
     icons = {"user": "🧑", "assistant": "🔭", "tool": "🔧", "cmd": "⌘"}
     lines = [f"🪐 **Ship log — {name}** · {len(entries)} entries"]
@@ -551,6 +581,15 @@ def yolo_active():
 
 def current_permission_mode():
     return "bypassPermissions" if yolo_active() else PERMISSION_MODE
+
+
+async def _noop(*_a, **_k):
+    return None
+
+
+async def _collect(bucket, text):
+    """A `respond` that keeps messages instead of posting them (shown only if something fails)."""
+    bucket.append(text)
 
 
 def parse_duration(text):
@@ -686,8 +725,10 @@ def webhook_name(s, maxlen=WEBHOOK_NAME_MAX):
     """"<project> · <session>", so which project a claude is working in reads at a
     glance. The session half is a slug of its first prompt, so that is what gets
     clipped — the project prefix is the part worth keeping."""
-    proj = (s.get("project") or "?").strip()
-    name = (s.get("name") or "claude").strip()
+    # Discord rejects (400) webhook usernames containing "discord" or "clyde"; a session named
+    # e.g. "discord-bot-fix" used to make every post in its thread fail (fix from chertu)
+    proj = WEBHOOK_RESERVED.sub("chat", (s.get("project") or "?").strip())
+    name = WEBHOOK_RESERVED.sub("chat", (s.get("name") or "claude").strip())
     if name == proj or name.startswith(proj + "-"):
         return name[:maxlen]
     room = min(24, maxlen - len(proj) - 3)
@@ -695,6 +736,9 @@ def webhook_name(s, maxlen=WEBHOOK_NAME_MAX):
         return name[:maxlen]
     short = (name[:room].rstrip("-") + "…") if len(name) > room else name
     return f"{proj} · {short}"
+
+
+WEBHOOK_RESERVED = re.compile(r"discord|clyde", re.I)
 
 
 # ---------- rendering ----------
@@ -732,9 +776,12 @@ def status_line(s, st=None):
     r = reach(s)
     ro = "" if r == "pane" else (" · 📨 **background** (talk via its inbox socket)" if r == "sock"
                                  else " · 👁️ **read-only**")
+    yolo = (st or {}).get("yolo") or {}
+    yl = (f"\n-# 🎲 **yolo** — bypass (everything allowed) until <t:{int(yolo['until'])}:t>, then "
+          f"back to {yolo.get('prev') or 'auto'}" if yolo.get("until", 0) > time.time() else "")
     return (f"**{s['name']}** · `{s['project']}`\n"
             f"{em} **{word}**{ro} · updated <t:{int(time.time())}:R>"
-            f"{model_line(st)}\n"
+            f"{model_line(st)}{yl}\n"
             f"-# [dashboard]({DASHBOARD}/s/{s['sid']}) · reply to talk · `!screen` · `!help`")
 
 
@@ -792,7 +839,12 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")   # images a claude Read
 WIDE_ASPECT = 2.2
 
 
+MISSING_VIEW = object()   # edit_as: "leave the message's buttons as they are"
 TWIN_GRACE = 20   # seconds a new process waits while another live process holds its conversation
+# /refresh (and the 🔄 Unstick button) relaunch a frozen claude in this permission mode
+UNSTICK_MODE = os.environ.get("UNSTICK_MODE", "bypassPermissions")
+MODE_ARG_WORD = {"bypassPermissions": "bypass", "auto": "auto", "plan": "plan", "acceptEdits": "accept edits",
+                 "default": "default"}
 
 
 def key_process_alive(key):
@@ -845,6 +897,9 @@ def update_card(st, items):
     changed = False
     for it in items:
         k = it["kind"]
+        if k == "result" and card is not None:
+            card["open_tool"] = False            # the running tool returned
+            continue
         if k not in ("tool", "thinking", "assistant"):
             continue
         if card is None:
@@ -857,6 +912,7 @@ def update_card(st, items):
             arg = _clean(it.get("text"), 220)
             card["tool"] = f"{'$ ' if name == 'Bash' else name + ' '}{arg}" if arg else name
             card["desc"] = _clean(it.get("desc"), 200)
+            card["open_tool"], card["tool_at"] = True, time.time()
         elif k == "thinking":
             card["thought"] = _clean(it["text"], 280)
         elif k == "assistant":
@@ -870,28 +926,258 @@ def update_card(st, items):
     return changed
 
 
-def card_text(s, card, final=False, model=None, base=None):
+# ---------- what the terminal shows: spinner, permission mode, fast mode ----------
+# "✢ Shimmying… (3m 38s · ↓ 18.7k tokens · thought for 60s)" — the line above the input box
+SPINNER_RE = re.compile(r"^\s*\S\s+([A-Z][\w'-]*(?:\s[\w'-]+){0,2})…\s*\((.+)\)\s*$")
+# footer "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt" -> the session's permission mode
+MODE_WORDS = (("bypass permissions", "bypass"), ("auto mode", "auto"), ("plan mode", "plan"),
+              ("accept edits", "accept edits"))
+MODE_BADGE = {"bypass": "🔓 bypass", "auto": "🛡️ auto", "plan": "📝 plan", "accept edits": "✏️ accept edits",
+              "default": "🔒 asks first"}
+
+
+def screen_info(pane):
+    """What the live terminal says that the transcript can't: is it thinking right now, the
+    output-token counter (moves while it thinks or writes), the permission mode on the footer
+    and the ↯ fast-mode glyph on the input box."""
+    info = {"mode": "", "fast_on": False, "spinner": "", "thinking": False, "thought_for": "", "tokens": ""}
+    if not pane:
+        return info
+    rc, scr = checkin.run(["tmux", "capture-pane", "-p", "-t", pane])
+    if rc != 0:
+        return info
+    lines = [re.sub(r"─{4,}", "──", l.rstrip()) for l in scr.splitlines() if l.strip()]
+    tail = lines[-6:]
+    footer = " ".join(tail[-3:]).lower()
+    info["mode"] = next((w for label, w in MODE_WORDS if label in footer), "default")
+    info["fast_on"] = any("↯" in l for l in tail)
+    for l in reversed(lines[-40:]):
+        m = SPINNER_RE.match(l)
+        if not m:
+            continue
+        info["spinner"] = m.group(1)
+        for part in m.group(2).split("·"):
+            p = part.strip()
+            if p[:1] in ("↓", "↑") and "token" in p:
+                info["tokens"] = p
+            elif p.startswith("thought for"):
+                info["thought_for"] = p
+            elif p.startswith("thinking"):
+                info["thinking"] = True
+        break
+    return info
+
+
+def _ago(secs):
+    secs = max(0, int(secs))
+    return f"{secs}s" if secs < 90 else f"{secs // 60}m" if secs < 5400 else f"{secs // 3600}h"
+
+
+def subs_text(subs, now=None, limit=4):
+    """'Explore — *Survey the fork* (4m) · general-purpose (1m) · 1 done' for the live subagents."""
+    now = now or time.time()
+    live = list((subs or {}).get("live", {}).values())
+    parts = []
+    for a in live[:limit]:
+        if isinstance(a, str):                    # entries written by older bridges
+            a = {"type": a}
+        p = a.get("type") or "agent"
+        if a.get("desc"):
+            p += f" — *{_clean(a['desc'], 60)}*"
+        if a.get("at"):
+            p += f" ({_ago(now - a['at'])})"
+        parts.append(p)
+    if len(live) > limit:
+        parts.append(f"+{len(live) - limit} more")
+    done = sum(((subs or {}).get("done") or {}).values())
+    if done:
+        parts.append(f"{done} done")
+    return " · ".join(parts)
+
+
+INBOX_EMOJI = {"sent": "📨", "queued": "⏳", "read": "👀", "done": "✅", "pulled": "↩️", "stuck": "⚠️"}
+INBOX_RANK = {"sent": 0, "stuck": 1, "pulled": 1, "queued": 2, "read": 3, "done": 4}
+
+
+def inbox_line(e, now=None):
+    """Where your latest Discord message is: typed, queued behind the running turn, or read."""
+    if not e:
+        return ""
+    now = now or time.time()
+    age = _ago(now - e["at"])
+    return {"sent": f"📨 typed your message {age} ago",
+            "queued": f"⏳ your message is **queued** ({age}) — Claude reads it at its next step",
+            "read": f"👀 Claude **read** your message ({_ago(now - e.get('t_read', e['at']))} ago)",
+            "pulled": "↩️ your message went back into the input box (turn interrupted) — not sent",
+            "stuck": f"⚠️ your message hasn't been picked up ({age}) — it may be sitting in the input box",
+            }.get(e["state"], "")
+
+
+def card_text(s, card, final=False, model=None, base=None, info=None):
+    """The live activity card. `info` carries what tick/render know beyond the transcript:
+    the terminal (screen_info), served speed, yolo deadline, subagents, your last message,
+    and how long since the last sign of progress."""
+    info = info or {}
+    scr = info.get("screen") or {}
     el = int(time.time() - card["started"])
     mm, ss = divmod(el, 60)
     counts = card.get("counts") or {}
     tools = ", ".join(f"{n} ×{k}" if k > 1 else n for n, k in counts.items())
-    mtag = ""
+    badges = []
     if model:
-        mtag = f" · 🧠 `{short_model(model)}`" + (" ⤵️" if base and model != base else "")
+        badges.append(f"🧠 `{short_model(model)}`" + (" ⤵️" if base and model != base else ""))
+    speed = info.get("speed")
+    if speed == "fast":
+        badges.append("⚡ fast")
+    elif scr.get("fast_on"):
+        badges.append("↯ fast on" + (f" · served {speed}" if speed else ""))
+    if info.get("yolo_until"):
+        badges.append(f"🎲 yolo until <t:{int(info['yolo_until'])}:t>")
+    elif scr.get("mode"):
+        badges.append(MODE_BADGE.get(scr["mode"], scr["mode"]))
+    btxt = (" · " + " · ".join(badges)) if badges else ""
+    subs = info.get("subs") or ""
     if final:
-        return (f"-# ✅ turn done · {mm}m {ss:02d}s" + (f" · 🔧 {tools}" if tools else "") + mtag)[:1990]
-    lines = [f"{STATUS_EMOJI.get(s['status'], '🔭')} **{STATUS_WORD.get(s['status'], s['status']).split(' —')[0]}** · {mm}m {ss:02d}s{mtag}"]
+        live_n = info.get("subs_live", 0)
+        tail = f" · 🧭 {live_n} subagent{'s' if live_n != 1 else ''} still running" if live_n else ""
+        return (f"-# ✅ turn done · {mm}m {ss:02d}s" + (f" · 🔧 {tools}" if tools else "") + btxt + tail)[:1990]
+    lines = [f"{STATUS_EMOJI.get(s['status'], '🔭')} **{STATUS_WORD.get(s['status'], s['status']).split(' —')[0]}** "
+             f"· {mm}m {ss:02d}s{btxt}"]
     if card.get("narration"):
         lines.append(f"*{card['narration']}*")
     if card.get("desc"):
         lines.append(f"**{card['desc']}**")
     if card.get("tool"):
-        lines.append(f"└ `{card['tool']}`")
+        run = ""
+        if card.get("open_tool") and card.get("tool_at") and time.time() - card["tool_at"] > 30:
+            run = f" · running {_ago(time.time() - card['tool_at'])}"
+        lines.append(f"└ `{card['tool']}`{run}")
+    if scr.get("thinking"):
+        lines.append("💭 **thinking now**" + (f" · {scr['tokens']}" if scr.get("tokens") else ""))
+    elif scr.get("tokens") and s["status"] == "busy":
+        lines.append(f"✍️ {scr.get('spinner') or 'working'}… · {scr['tokens']}"
+                     + (f" · {scr['thought_for']}" if scr.get("thought_for") else ""))
     if card.get("thought"):
         lines.append(f"💭 {card['thought']}")
+    if subs:
+        n = info.get("subs_live", 0)
+        lines.append(f"🧭 **{n} subagent{'s' if n != 1 else ''}**: {subs}" if n else f"🧭 {subs}")
+    if info.get("inbox"):
+        lines.append(info["inbox"])
+    if info.get("stalled"):
+        lines.append(f"⚠️ no new output for {_ago(info['stalled'])} — 🔄 **Unstick** if it's frozen")
     if tools:
         lines.append(f"-# 🔧 {tools}")
     return "\n".join(lines)[:1990]
+
+
+def card_view(key, info=None):
+    """Buttons under a running turn's card, matched to what it is doing. custom_id `c|<key>|<action>`
+    is handled in Bridge.on_interaction, so presses keep working across bridge restarts."""
+    info = info or {}
+    scr = info.get("screen") or {}
+    view = discord.ui.View(timeout=None)
+    B, S = discord.ui.Button, discord.ButtonStyle
+    stop_label = "⏹ Stop thinking" if scr.get("thinking") else "⏹ Interrupt"
+    view.add_item(B(label=stop_label, style=S.danger, custom_id=f"c|{key}|esc", row=0))
+    view.add_item(B(label="✋ Interrupt & say…", style=S.primary, custom_id=f"c|{key}|say", row=0))
+    view.add_item(B(label="🖥 Screen", style=S.secondary, custom_id=f"c|{key}|scr", row=0))
+    fast = info.get("speed") == "fast" or scr.get("fast_on")
+    view.add_item(B(label="⚡ Fast: on → off" if fast else "⚡ Fast: off → on", style=S.secondary,
+                    custom_id=f"c|{key}|fast", row=1))
+    view.add_item(B(label="🔒 End yolo" if info.get("yolo_until") else "🎲 Yolo 1h", style=S.secondary,
+                    custom_id=f"c|{key}|yolo", row=1))
+    if info.get("stalled"):
+        view.add_item(B(label="🔄 Unstick", style=S.danger, custom_id=f"c|{key}|unstick", row=1))
+    return view
+
+
+# ---------- Markdown tables -> labelled rows (Discord renders pipe tables as raw text) ----------
+# From recursiveforte/chertu (chert/discord/markdown.py, MIT).
+
+def _cells(line):
+    """Split unescaped pipes outside inline code, with optional outer pipes."""
+    line = line.strip()
+    cells, start, index = [], 0, 0
+    while index < len(line):
+        char = line[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "`":
+            run = re.match(r"`+", line[index:])[0]
+            end = re.search(r"(?<!`)" + re.escape(run) + r"(?!`)", line[index + len(run):])
+            if end:
+                index += len(run) + end.end()
+                continue
+            index += len(run)
+            continue
+        if char == "|":
+            cells.append(line[start:index].strip())
+            start = index + 1
+        index += 1
+    if not cells:
+        return None
+    cells.append(line[start:].strip())
+    if line.startswith("|"):
+        cells.pop(0)
+    if start == len(line):
+        cells.pop()
+    return cells
+
+
+def discord_tables(text):
+    """Render complete pipe tables as labeled rows before message chunking.
+
+    Prose and code examples stay verbatim. Requiring a matching delimiter row
+    avoids treating ordinary pipes as tables; malformed rows remain visible.
+    """
+    lines = text.splitlines(keepends=True)
+    out = []
+    index = 0
+    fence = None
+    while index < len(lines):
+        line = lines[index]
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                fence = None
+        elif marker:
+            fence = marker[1]
+        elif not line.startswith(("    ", "\t")) and index + 1 < len(lines):
+            headers = _cells(line)
+            separator = _cells(lines[index + 1])
+            if (headers and separator and len(headers) == len(separator)
+                    and all(re.fullmatch(r":?-{3,}:?", cell) for cell in separator)):
+                end = index + 2
+                rows = []
+                while end < len(lines):
+                    cells = _cells(lines[end])
+                    if cells is None or len(cells) != len(headers):
+                        break
+                    rows.append(cells)
+                    end += 1
+                if rows:
+                    rendered = []
+                    for row in rows:
+                        fields = []
+                        for column, (header, value) in enumerate(zip(headers, row), 1):
+                            label = header or f"Column {column}"
+                            if not (label.startswith("**") and label.endswith("**")):
+                                label = f"**{label}**"
+                            fields.append(f"{label}: {value}")
+                        # Discord collapses indented list continuation lines,
+                        # joining adjacent cells without even a space. Keep
+                        # fields on ordinary lines and separate rows by a gap.
+                        rendered.append("\n".join(fields))
+                    out.append("\n\n".join(rendered))
+                    if lines[end - 1].endswith("\n"):
+                        out.append("\n")
+                    index = end
+                    continue
+        out.append(line)
+        index += 1
+    return "".join(out)
 
 
 def format_new_items(items, sid, include_tools=True):
@@ -916,7 +1202,7 @@ def format_new_items(items, sid, include_tools=True):
                 tools.append(it.get("name", "?"))
         elif k == "assistant":
             flush_tools()
-            chunks = split_chunks(it["text"])
+            chunks = split_chunks(discord_tables(it["text"]))
             if len(chunks) > 5:
                 chunks = chunks[:5] + [f"-# …truncated — [full reply]({DASHBOARD}/s/{sid})"]
             if len(chunks) > 1:
@@ -1119,17 +1405,18 @@ def spawn_flags():
     return " ".join(shlex.quote(t) for t in out)
 
 
-def spawn_claude(name, cwd, resume_sid=None, fork=False, extra_flags="", env=None):
+def spawn_claude(name, cwd, resume_sid=None, fork=False, extra_flags="", env=None, mode=None):
     """Launch a claude in its own tmux window. Returns (pane_id, err).
 
     With resume_sid, resumes that conversation (`-r`) so a background agent with no
     tty comes back as a steerable, tmux-backed session with its history intact.
     If claude exits (bad flag, crash) the window drops to a shell instead of
     vanishing, so the error stays visible via !screen. `env` adds variables for this
-    launch only (e.g. the agent-teams flag for Feldspar).
+    launch only (e.g. the agent-teams flag for Feldspar). `mode` overrides the
+    permission mode (e.g. bypassPermissions when unsticking).
     """
     ensure_trusted(cwd)
-    flags = spawn_flags()
+    flags = with_mode(spawn_flags(), mode)
     if extra_flags:
         flags += " " + extra_flags
     if resume_sid:
@@ -1220,6 +1507,29 @@ def restart_flags(argv):
             out.append(argv[i + 1])
             i += 1
         i += 1
+    return " ".join(shlex.quote(t) for t in out)
+
+
+def with_mode(flags, mode):
+    """`flags` (a shell string) with its permission mode replaced by `mode`. Keeps
+    --allow-dangerously-skip-permissions in, so bypass stays in the shift+tab cycle and
+    `/mode` can move the session back and forth afterwards."""
+    if not mode:
+        return flags
+    out, skip = [], False
+    for t in shlex.split(flags):
+        if skip:
+            skip = False
+            continue
+        if t == "--permission-mode":
+            skip = True
+            continue
+        if t.startswith("--permission-mode=") or t == "--dangerously-skip-permissions":
+            continue
+        out.append(t)
+    if "--allow-dangerously-skip-permissions" not in out:
+        out.append("--allow-dangerously-skip-permissions")
+    out += ["--permission-mode", mode]
     return " ".join(shlex.quote(t) for t in out)
 
 
@@ -1592,6 +1902,40 @@ def prompt_view(key, opts):
     return view
 
 
+class SayModal(discord.ui.Modal):
+    """The form behind ✋ Interrupt & say… (submission handled in Bridge.on_say_modal via its
+    custom_id, so it works even if the bridge restarted while the form was open)."""
+
+    def __init__(self, key):
+        super().__init__(title="Interrupt and say…", custom_id=f"m|{key}|say", timeout=None)
+        self.add_item(discord.ui.TextInput(label="Message (sent right after the Esc)", custom_id="text",
+                                           style=discord.TextStyle.paragraph, max_length=1900))
+
+
+def _modal_value(data):
+    """The first text value anywhere in a modal submission's component tree."""
+    if isinstance(data, dict):
+        if isinstance(data.get("value"), str):
+            return data["value"]
+        for v in (data.get("components"), data.get("component")):
+            got = _modal_value(v)
+            if got:
+                return got
+    elif isinstance(data, list):
+        for v in data:
+            got = _modal_value(v)
+            if got:
+                return got
+    return ""
+
+
+def resurrect_view(key):
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="♻️ Resurrect", style=discord.ButtonStyle.success,
+                                    custom_id=f"rv|{key}"))
+    return view
+
+
 def prompt_body(text, note=""):
     body = text[-1500:] if text else "(blank screen)"
     return f"{note}```\n{body}\n```"
@@ -1623,6 +1967,13 @@ class Bridge(discord.Client):
         self._titles = {}                  # thread id -> title it should have (see retitle)
         self._retitling = set()
         self._title_tasks = set()
+        # tmux pane -> claim expiry. A pane the bridge just launched a claude into belongs to the
+        # launcher (summon/fork/resume/revive/restart) until it has written the thread entry:
+        # the poller (woken by the SessionStart hook) used to open a second thread for it.
+        self._claimed_panes = {}
+        self._receipt_locks = {}           # discord message id -> lock serialising its reaction swaps
+        self._bg = set()                   # fire-and-forget tasks (keep a reference until done)
+        self._last_idle_check = 0.0
         self.tree = discord.app_commands.CommandTree(self)
         self.register_commands()
 
@@ -1862,13 +2213,19 @@ class Bridge(discord.Client):
     def hook_subagent(self, name, ev, st):
         subs = st.get("subs")
         if not subs or subs.get("closed"):
-            subs = st["subs"] = {"live": {}, "done": {}, "msg": None, "closed": False, "started": time.time()}
+            # a new turn starts a new line, but background subagents from the last one are
+            # still running: carry them over instead of losing track of them
+            carry = dict((subs or {}).get("live") or {})
+            subs = st["subs"] = {"live": carry, "done": {}, "msg": None, "closed": False, "started": time.time()}
         aid = str(ev.get("agent_id") or ev.get("tool_use_id") or time.time())
+        if not ev.get("agent_type") and aid not in subs["live"]:
+            return       # Claude Code's own helper agents (no type, never started visibly): not yours
         atype = str(ev.get("agent_type") or "agent")
         if name == "SubagentStart":
-            subs["live"][aid] = atype
+            subs["live"][aid] = {"type": atype, "at": time.time()}
         else:
-            atype = subs["live"].pop(aid, atype)
+            a = subs["live"].pop(aid, atype)
+            atype = a.get("type", atype) if isinstance(a, dict) else a
             subs["done"][atype] = subs["done"].get(atype, 0) + 1
 
     def schedule_subs_render(self, key, s, st):
@@ -1887,19 +2244,19 @@ class Bridge(discord.Client):
         asyncio.create_task(later())
 
     async def render_subs(self, key, s, st):
+        """The 🧭 subagent line. While a turn's activity card is up, the card shows subagents
+        (and its next edit picks the change up); this separate line is for subagents that
+        outlive the turn (background agents)."""
         subs = st.get("subs")
         if not subs:
             return
-        live_c = Counter(subs["live"].values())
-        fmt = lambda c: ", ".join(f"{t} ×{n}" if n > 1 else t for t, n in c.items())  # noqa: E731
-        done_n = sum(subs["done"].values())
-        if subs["live"]:
-            line = f"-# 🧭 {len(subs['live'])} subagent{'s' if len(subs['live']) != 1 else ''} exploring: {fmt(live_c)}"
-            if done_n:
-                line += f" · {done_n} done"
-        else:
-            line = f"-# 🧭 {done_n} subagent{'s' if done_n != 1 else ''} done: {fmt(Counter(subs['done']))}"
-        line = line[:1990]
+        if st.get("card"):
+            st["card"]["dirty"] = True
+            return
+        self.pair_agent_descs(st)
+        n = len(subs["live"])
+        line = (f"-# 🧭 {n} subagent{'s' if n != 1 else ''} running: {subs_text(subs)}" if n
+                else f"-# 🧭 subagents done: {subs_text(subs)}")[:1990]
         parent = await self.get_thread(st.get("parent", CHANNEL_ID)) or self.main_channel
         if subs.get("msg"):
             try:
@@ -1929,6 +2286,130 @@ class Bridge(discord.Client):
         now = time.time()
         return any(now - ts < 1800 and (norm == t or norm.startswith(t[:120]) or t.startswith(norm[:120]))
                    for ts, t in self._sent.get(key, ()))
+
+    # ---------- read receipts: is it thinking about my message, or ignoring it? ----------
+
+    def track_inbox(self, key, msg, text, author=None):
+        """Remember a Discord message we are about to type into a session, so the transcript's
+        queue events ("enqueue" while it is busy, "remove: absorbed_mid_turn"/"dequeue" when the
+        model takes it in) and its user turns can be matched back to it."""
+        st = state.get(key)
+        if st is None or getattr(msg, "id", None) is None or getattr(msg, "channel", None) is None:
+            return None
+        author = author or msg.author
+        payload = attribute(author.id, author.display_name, text, self.owner)
+        e = {"mid": msg.id, "ch": msg.channel.id, "norm": " ".join(payload.split())[:200],
+             "at": time.time(), "state": "sent", "shown": None,
+             # slash commands and <tags> never show up as a user turn: don't call them stuck
+             "no_stuck": payload.lstrip()[:1] in ("/", "<")}
+        ib = st.setdefault("inbox", [])
+        ib.append(e)
+        del ib[:-6]
+        return e
+
+    def drop_inbox(self, key, e):
+        ib = (state.get(key) or {}).get("inbox") or []
+        if e in ib:
+            ib.remove(e)
+
+    def sync_receipt_soon(self, e):
+        if e:
+            self.spawn_bg(self.sync_receipt(e))
+
+    def spawn_bg(self, coro):
+        t = asyncio.create_task(coro)
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+        return t
+
+    async def sync_receipt(self, e):
+        """Make the message's bot reaction match its state: one reaction at a time, swapped in
+        place. Runs in the background (a 429 on reactions must never stall a tick)."""
+        lock = self._receipt_locks.setdefault(e["mid"], asyncio.Lock())
+        async with lock:
+            want = INBOX_EMOJI.get(e["state"])
+            if not want or e.get("shown") == want:
+                return
+            ch = self.get_channel(e["ch"]) or await self.get_thread(e["ch"])
+            if ch is None:
+                return
+            pm = ch.get_partial_message(e["mid"])
+            try:
+                if e.get("shown"):
+                    await pm.remove_reaction(e["shown"], self.user)
+                await pm.add_reaction(want)
+                e["shown"] = want
+            except discord.HTTPException as ex:
+                log_error("receipt", ex)
+        if len(self._receipt_locks) > 500:
+            self._receipt_locks.clear()
+
+    @staticmethod
+    def _same_text(a, b):
+        a, b = " ".join((a or "").split())[:200], " ".join((b or "").split())[:200]
+        return bool(a and b) and (a == b or a.startswith(b[:120]) or b.startswith(a[:120]))
+
+    def process_inbox(self, key, st, items, status):
+        """Advance read receipts from new transcript items. Returns True if any changed."""
+        ib = st.get("inbox") or []
+        if not ib:
+            return False
+        changed = False
+        for it in items:
+            k = it["kind"]
+            if k == "queue":
+                op, reason = it.get("op"), it.get("reason")
+                new = ("queued" if op == "enqueue" else
+                       "read" if op == "dequeue" or reason in ("absorbed_mid_turn", "delivered_to_agent") else
+                       "pulled" if op == "remove" else None)
+            elif k in ("user", "cmd"):
+                new = "read"
+            else:
+                continue
+            if not new:
+                continue
+            for e in ib:
+                if e["state"] in ("read", "done") or not self._same_text(e["norm"], it.get("text")):
+                    continue
+                if new == "pulled" or INBOX_RANK[new] > INBOX_RANK[e["state"]]:
+                    e["state"] = new
+                    e["t_" + new] = time.time()
+                    changed = True
+                    self.sync_receipt_soon(e)
+                break
+        now = time.time()
+        for e in ib:
+            # typed in a minute ago, the claude isn't busy, and nothing in its transcript took it:
+            # it is sitting in the input box (a paste that never got its Enter, a dialog ate it…)
+            if e["state"] == "sent" and status == "idle" and now - e["at"] > 75 and not e.get("no_stuck"):
+                e["state"] = "stuck"
+                changed = True
+                self.sync_receipt_soon(e)
+                self.spawn_bg(self.stuck_note(key, st))
+        return changed
+
+    async def stuck_note(self, key, st):
+        thread = await self.get_thread(st.get("thread"))
+        if not thread:
+            return
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label="⏎ Press Enter", style=discord.ButtonStyle.success,
+                                        custom_id=f"k|{key}|Enter"))
+        view.add_item(discord.ui.Button(label="🖥 Screen", style=discord.ButtonStyle.secondary,
+                                        custom_id=f"k|{key}|__refresh"))
+        try:
+            await thread.send("-# ⚠️ Claude hasn't taken in your message after a minute and isn't busy — "
+                              "it's probably sitting in the input box", view=view, allowed_mentions=NO_PING)
+        except discord.HTTPException as e:
+            log_error("stuck note", e)
+
+    def finish_inbox(self, st):
+        """The turn ended: everything it had read is answered."""
+        for e in st.get("inbox") or []:
+            if e["state"] == "read":
+                e["state"] = "done"
+                self.sync_receipt_soon(e)
+        st["inbox"] = [e for e in st.get("inbox") or [] if time.time() - e["at"] < 86400]
 
     # ---------- plumbing ----------
 
@@ -2005,14 +2486,17 @@ class Bridge(discord.Client):
         except discord.HTTPException as e:
             print(f"webhook {wh.id}: avatar edit failed ({e})", flush=True)
 
-    async def post_as(self, channel, name, content, thread_id=None, seed=None):
+    async def post_as(self, channel, name, content, thread_id=None, seed=None, view=None):
         """Post under a per-agent identity via the channel webhook. Returns the message.
 
-        `seed` fixes the avatar to something stable (a session's pid:procStart).
+        `seed` fixes the avatar to something stable (a session's pid:procStart). `view` adds
+        buttons (allowed because the bot itself created the webhook).
         """
         wh = await self.webhook_for(channel)
         kwargs = dict(content=content[:2000], username=name[:WEBHOOK_NAME_MAX],
                       allowed_mentions=NO_PING, suppress_embeds=True, wait=True)
+        if view is not None:
+            kwargs["view"] = view
         if avatar_bytes() is None:
             kwargs["avatar_url"] = avatar_url(seed or name)
         if thread_id:
@@ -2026,15 +2510,29 @@ class Bridge(discord.Client):
         except discord.HTTPException as e:
             if thread_id and e.code == 50083 and await self.unarchive(thread_id):
                 return await wh.send(**kwargs)
+            if "view" in kwargs and e.status == 400:
+                log_error("webhook buttons refused", e)     # keep the text, drop the buttons
+                kwargs.pop("view")
+                return await wh.send(**kwargs)
             raise
 
-    async def edit_as(self, channel, message_id, content, thread_id=None):
-        """Edit a previously webhook-posted message (used to grow the tool-call line)."""
+    async def edit_as(self, channel, message_id, content, thread_id=None, view=MISSING_VIEW):
+        """Edit a previously webhook-posted message (used to grow the tool-call line and the
+        activity card). `view=None` removes the buttons; leaving it out keeps them."""
         wh = await self.webhook_for(channel)
         kwargs = {"content": content[:2000]}
+        if view is not MISSING_VIEW:
+            kwargs["view"] = view
         if thread_id:
             kwargs["thread"] = discord.Object(id=thread_id)
-        await wh.edit_message(message_id, **kwargs)
+        try:
+            await wh.edit_message(message_id, **kwargs)
+        except discord.HTTPException as e:
+            if kwargs.get("view") is None or e.status != 400:
+                raise
+            log_error("webhook buttons refused", e)
+            kwargs.pop("view")
+            await wh.edit_message(message_id, **kwargs)
 
     async def post_entry(self, parent, s, st, kind, payload):
         """Post one streamed entry, merging consecutive tool runs into one edited line."""
@@ -2161,7 +2659,7 @@ class Bridge(discord.Client):
             except Exception as e:  # noqa: BLE001
                 log_error("tick", e)
             for fn in (self.chat_tick, self.prompt_tick, self.disk_tick, self.drain_spool,
-                       self.board_tick, self.supernova_tick):
+                       self.board_tick, self.supernova_tick, self.idle_tick):
                 try:
                     await fn()
                 except Exception as e:  # noqa: BLE001
@@ -2175,6 +2673,7 @@ class Bridge(discord.Client):
                     await self.change_presence(activity=discord.CustomActivity(pres))
             except Exception as e:  # noqa: BLE001
                 log_error("presence", e)
+            self.heartbeat()
             await asyncio.sleep(POLL_SECS)
 
     async def tick(self, channel):
@@ -2187,6 +2686,8 @@ class Bridge(discord.Client):
             st = state.get(key)
             if st is not None and (st.get("pending") or st.get("restarting")):
                 continue  # a summon/restart is mid-flight and owns this session's thread
+            if (st is None or st.get("ended")) and self.pane_claimed(s.get("pane")):
+                continue  # the bridge launched it a moment ago; the launcher opens its thread
             if st is not None and st.get("ended") and st.get("thread"):
                 # This exact process is live again although we recorded it as ended: it only
                 # dropped out of one registry read. Keep its thread; never open a twin over it.
@@ -2306,6 +2807,15 @@ class Bridge(discord.Client):
                 if thread:
                     await self.say(thread, f"-# applied the queued `{cmd} {val}`" if ok
                                    else f"-# ⚠️ couldn't apply the queued `{cmd} {val}`")
+        # a per-session /yolo whose time is up: back to the mode it had (not over an open dialog —
+        # shift+tab would land in the dialog)
+        y = st.get("yolo")
+        if y and time.time() >= y.get("until", 0) and s.get("pane") and s["status"] != "waiting":
+            st.pop("yolo", None)
+            save_state()
+            thread = await self.get_thread(st.get("thread"))
+            self.spawn_bg(self.end_session_yolo(
+                key, st, y, (lambda t, th=thread: self.say(th, t)) if thread else _noop))
         if st.get("muted"):
             st["status"] = s["status"]
             return
@@ -2318,8 +2828,19 @@ class Bridge(discord.Client):
                 items, consumed = await asyncio.to_thread(
                     checkin.parse_transcript, Path(s["transcript"]),
                     st["size"], checkin.TAIL_BYTES, True)
-                items = [it for it in items
-                         if not (it["kind"] == "user" and self.is_echo(key, it["text"]))]
+                st["progress_at"] = time.time()
+                if self.process_inbox(key, st, items, s["status"]) and st.get("card"):
+                    st["card"]["dirty"] = True
+                for it in items:
+                    if it.get("speed"):
+                        st["speed"] = it["speed"]
+                    if it["kind"] == "tool" and it.get("name") in ("Agent", "Task"):
+                        ad = st.setdefault("agent_descs", [])
+                        ad.append({"type": it.get("sub") or "general-purpose",
+                                   "desc": it.get("desc") or it.get("text") or "", "at": time.time()})
+                        del ad[:-12]
+                items = [it for it in items if it["kind"] != "queue"
+                         and not (it["kind"] == "user" and self.is_echo(key, it["text"]))]
                 update_card(st, items)
                 await self.track_models(s, st, items)
                 await self.mirror_images(s, st, items)
@@ -2359,6 +2880,9 @@ class Bridge(discord.Client):
                         st["tool_msg"] = None
                 st["size"] = consumed
                 save_state()
+        if any(e["state"] == "sent" for e in st.get("inbox") or ()) \
+                and self.process_inbox(key, st, [], s["status"]) and st.get("card"):
+            st["card"]["dirty"] = True                 # a message went "stuck" with no new output
         if st.get("card"):
             parent = await self.get_thread(st.get("parent", CHANNEL_ID)) or channel
             await self.render_card(parent, s, st)
@@ -2367,6 +2891,8 @@ class Bridge(discord.Client):
             prev = st["status"]
             st["status"] = s["status"]
             st["name"] = s["name"]
+            if s["status"] in ("idle", "shell"):
+                self.finish_inbox(st)
             thread = await self.edit_status(st, s)
             if prev == "waiting" and st.get("prompt_msg"):
                 await self.close_prompt(st, thread)
@@ -2455,7 +2981,8 @@ class Bridge(discord.Client):
         save_state()
 
     async def render_card(self, parent, s, st):
-        """Post or edit the session's activity card; collapse it once the turn is over."""
+        """Post or edit the session's activity card; collapse it once the turn is over. While the
+        turn runs the card carries buttons matched to what the claude is doing (card_view)."""
         card = st.get("card")
         if not card:
             return
@@ -2468,17 +2995,20 @@ class Bridge(discord.Client):
                     return                          # coalesce a burst; next tick renders it
             elif since < CARD_HEARTBEAT:
                 return
-        text = card_text(s, card, final, model=st.get("model"), base=st.get("model_base"))
+        info = await self.card_info(s, st, card, final)
+        text = card_text(s, card, final, model=st.get("model"), base=st.get("model_base"), info=info)
         if text == card.get("body") and not final:
+            card["last_edit"] = now
             return
+        view = None if final else card_view(s["key"], info)
         try:
             if card.get("msg"):
                 try:
-                    await self.edit_as(parent, card["msg"], text, st["thread"])
+                    await self.edit_as(parent, card["msg"], text, st["thread"], view=view)
                 except discord.HTTPException:
                     card["msg"] = None                # message gone; post a fresh one
             if not card.get("msg"):
-                m = await self.post_as(parent, webhook_name(s), text, st["thread"], seed=s["key"])
+                m = await self.post_as(parent, webhook_name(s), text, st["thread"], seed=s["key"], view=view)
                 card["msg"] = m.id if m else None
         except discord.HTTPException as e:
             log_error("card", e)
@@ -2487,6 +3017,48 @@ class Bridge(discord.Client):
             st["card"] = None
             st["tool_msg"] = None
         save_state()
+
+    async def card_info(self, s, st, card, final):
+        """Everything the card shows beyond the transcript: the terminal (thinking now? token
+        counter, permission mode, ↯ fast), served speed, yolo, subagents, your last message, and
+        whether it has stopped making progress."""
+        now = time.time()
+        scr = await asyncio.to_thread(screen_info, s.get("pane")) if s.get("pane") and not final else {}
+        # the spinner's token counter moving counts as progress (long thinking writes nothing
+        # to the transcript until it is done)
+        if scr.get("tokens") and scr["tokens"] != card.get("tokens_seen"):
+            card["tokens_seen"] = scr["tokens"]
+            st["progress_at"] = now
+        idle_for = now - max(st.get("progress_at") or 0, card.get("started") or 0)
+        stalled = (not final and s["status"] == "busy" and not card.get("open_tool")
+                   and not scr.get("thinking") and idle_for > STALL_SECS)
+        subs = st.get("subs") or {}
+        self.pair_agent_descs(st)
+        inbox = (st.get("inbox") or [None])[-1]
+        if inbox and (now - inbox["at"] > 1800 or inbox["state"] == "done"):
+            inbox = None
+        y = st.get("yolo") or {}
+        return {"screen": scr, "speed": st.get("speed"),
+                "yolo_until": y.get("until") if y.get("until", 0) > now else None,
+                "subs": subs_text(subs, now) if (subs.get("live") or not final) and subs else "",
+                "subs_live": len(subs.get("live") or {}),
+                "inbox": inbox_line(inbox, now) if inbox else "",
+                "stalled": int(idle_for) if stalled else 0}
+
+    def pair_agent_descs(self, st):
+        """Give each live subagent (from the SubagentStart hook) the description its Agent call
+        carried in the transcript: same subagent type, in launch order."""
+        live = (st.get("subs") or {}).get("live") or {}
+        descs = st.get("agent_descs") or []
+        for aid, a in list(live.items()):
+            if isinstance(a, str):
+                a = live[aid] = {"type": a, "at": None}
+            if a.get("desc"):
+                continue
+            for d in descs:
+                if not d.get("used") and d["type"] == a.get("type") and d["at"] >= (a.get("at") or 0) - 120:
+                    a["desc"], d["used"] = d["desc"], True
+                    break
 
     async def open_prompt(self, s, st, thread, note=""):
         """A claude is blocked on you: ping, show its screen, and turn the menu it is
@@ -2524,11 +3096,22 @@ class Bridge(discord.Client):
             pass
 
     async def on_interaction(self, interaction):
-        """Button presses. custom_id: `o|<key>|<n>` (menu option) or `k|<key>|<tmuxkey>`."""
+        """Button presses. custom_id: `o|<key>|<n>` (menu option), `k|<key>|<tmuxkey>`,
+        `c|<key>|<action>` (activity-card controls), `rv|<key>` (resurrect), and the
+        `m|<key>|say` form behind "Interrupt & say…"."""
+        if interaction.type == discord.InteractionType.modal_submit:
+            cid = (interaction.data or {}).get("custom_id", "")
+            if cid.startswith("m|"):
+                await self.on_say_modal(interaction, cid.split("|")[1])
+            return
         if interaction.type != discord.InteractionType.component:
             return
         cid = (interaction.data or {}).get("custom_id", "")
         parts = cid.split("|")
+        if len(parts) == 3 and parts[0] == "c":
+            return await self.on_card_button(interaction, parts[1], parts[2])
+        if len(parts) == 2 and parts[0] == "rv":
+            return await self.on_resurrect(interaction, parts[1])
         if len(parts) == 3 and parts[0] == "rp":              # !resume list: paging
             q, page = parts[1], int(parts[2] or 0)
             try:
@@ -2610,6 +3193,117 @@ class Bridge(discord.Client):
             st.pop("prompt_msg", None)
             save_state()
 
+    # ---------- activity-card controls ----------
+
+    async def on_card_button(self, interaction, key, action):
+        """⏹ Interrupt / ✋ Interrupt & say… / 🖥 Screen / ⚡ Fast / 🎲 Yolo / 🔄 Unstick."""
+        user = interaction.user
+        who = getattr(user, "display_name", "someone")
+
+        async def ephemeral(text, **kw):
+            try:
+                await interaction.followup.send(text[:2000], ephemeral=True, allowed_mentions=NO_PING, **kw)
+            except discord.HTTPException as e:
+                log_error("card button reply", e)
+
+        st = state.get(key)
+        s = await asyncio.to_thread(find_live_by_key, key)
+        if action == "say":                     # a modal must be the FIRST response — no defer
+            if not s or not reach(s):
+                return await interaction.response.send_message("👻 that claude is gone", ephemeral=True)
+            return await interaction.response.send_modal(SayModal(key))
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+        except discord.HTTPException:
+            pass
+        if not st or not s or not s.get("pane"):
+            return await ephemeral("👻 that claude is gone (or has no tmux pane) — `/revive` it")
+        thread = await self.get_thread(st.get("thread"))
+        in_thread = (lambda t: self.say(thread, t)) if thread else ephemeral
+        if action == "esc":
+            ok, _ = await asyncio.to_thread(checkin.send_to_session, s, None, "Escape")
+            await ephemeral("⏹ sent Esc — the turn stops at the next safe point" if ok else "⚠️ couldn't send Esc")
+            if ok and thread:
+                await self.say(thread, f"-# ⏹ interrupted by {who}")
+        elif action == "scr":
+            text = await asyncio.to_thread(screen_text, s["pane"])
+            opts = parse_options(text)[0] if s["status"] == "waiting" else []
+            await ephemeral(prompt_body(text), **({"view": prompt_view(key, opts)} if s["status"] == "waiting" else {}))
+        elif action == "fast":
+            info = await asyncio.to_thread(screen_info, s["pane"])
+            on = st.get("speed") == "fast" or info.get("fast_on")
+            await self.set_fast(key, st, user, ephemeral, "off" if on else "on")
+        elif action == "yolo":
+            if not self.privileged(user):
+                return await ephemeral("🔐 yolo is owner-only")
+            y = st.get("yolo") or {}
+            await self.session_yolo(key, st, in_thread, None if y.get("until", 0) > time.time() else 3600)
+        elif action == "unstick":
+            await ephemeral("🔄 unsticking — progress goes in the thread")
+            await self.refresh_session(key, st, thread, in_thread, force=True)
+        if st.get("card"):
+            st["card"]["dirty"] = True
+
+    async def on_say_modal(self, interaction, key):
+        """✋ Interrupt & say…: Esc the running turn, wait for it to stop, then type the text in.
+        The text is echoed into the thread so it gets read receipts like any message."""
+        text = _modal_value(interaction.data or {}).strip()
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+        except discord.HTTPException:
+            pass
+        s = await asyncio.to_thread(find_live_by_key, key)
+        st = state.get(key)
+        if not text or not s or not st or not reach(s):
+            return
+        if s["status"] in ("busy", "waiting") and s.get("pane"):
+            await asyncio.to_thread(checkin.send_to_session, s, None, "Escape")
+            for _ in range(12):                    # until the turn has actually stopped
+                await asyncio.sleep(0.5)
+                s2 = await asyncio.to_thread(find_live_by_key, key)
+                if s2 and s2["status"] not in ("busy",):
+                    s = s2
+                    break
+            await asyncio.sleep(0.5)
+        thread = await self.get_thread(st.get("thread"))
+        who = getattr(interaction.user, "display_name", "someone")
+        echo = await self.say(thread, f"✋ **{who}** interrupted: {text}") if thread else None
+        entry = None
+        if echo:
+            entry = self.track_inbox(key, echo, text, author=interaction.user)
+        ok, err = await asyncio.to_thread(self.deliver, s, interaction.user, text)
+        if ok:
+            self.sync_receipt_soon(entry)
+        else:
+            self.drop_inbox(key, entry)
+            if thread:
+                await self.say(thread, f"-# ⚠️ not delivered: {err}")
+
+    async def on_resurrect(self, interaction, key):
+        """♻️ Resurrect on an ended / idle-shut-down session: revive it into its own thread."""
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass
+        st = state.get(key)
+        if not st:
+            try:
+                await interaction.followup.send("🪐 that session has aged out of my state — `/resume` finds it",
+                                                ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
+        thread = await self.get_thread(st.get("thread"))
+        who = getattr(interaction.user, "display_name", "someone")
+        sess = await self.revive(key, st, thread,
+                                 reporter=(lambda t: self.say(thread, t)) if thread else None)
+        try:
+            if sess:
+                await interaction.message.edit(content=f"{interaction.message.content}\n-# ♻️ resurrected by {who}",
+                                               view=None)
+        except discord.HTTPException as e:
+            log_error("resurrect edit", e)
+
     async def session_gone(self, key, st, phantoms):
         """A tracked session is no longer live. Clean exits archive the thread; a crash
         (registry file left behind = the process never cleaned up) keeps the thread open
@@ -2629,7 +3323,11 @@ class Bridge(discord.Client):
                        f"{'died' if reason == 'crash' else 'ended'}")
         if reason == "exit":
             hint = END_REASON_WORDS.get(st.pop("end_reason_hint", "") or "", "session exited")
-            await self.say(thread, f"-# 🌌 loop ended — {hint}")
+            try:
+                await thread.send(f"-# 🌌 loop ended — {hint}", view=resurrect_view(key),
+                                  allowed_mentions=NO_PING)
+            except discord.HTTPException as e:
+                log_error("loop ended", e)
             try:
                 await thread.edit(name=ended_title(st.get("name", "")), archived=True)
             except discord.HTTPException:
@@ -2641,12 +3339,74 @@ class Bridge(discord.Client):
             await self.say(thread, "💥 **supernova** — this session vanished without a clean exit "
                                    "(crash, OOM, or a hard kill). `!revive` brings it back with its "
                                    "history intact.", ping_owner=True)
+            try:
+                await thread.send("-# one tap brings it back:", view=resurrect_view(key), allowed_mentions=NO_PING)
+            except discord.HTTPException as e:
+                log_error("crash resurrect", e)
             await self.say(self.main_channel,
                            f"💥 **{st.get('name', '?')}** died without a clean exit · "
                            f"`!revive` in <#{thread.id}>")
             if REVIVE_ON_CRASH and st.get("sid"):
                 await self.revive(key, st, thread, reporter=lambda t: self.say(thread, t))
         # reboot: after_reboot() handles the whole batch
+
+    async def idle_tick(self):
+        """Shut down claudes nobody has touched in IDLE_SHUTDOWN_DAYS (clean SIGTERM, history kept),
+        archive their thread, and leave a silent ♻️ Resurrect button there. Busy / shell / waiting
+        sessions, ones with subagents still running, ctrl-z'd ones and the #all-claudes hub are
+        never touched; a /loop cron keeps its session's transcript fresh, so it never qualifies."""
+        if IDLE_SHUTDOWN_DAYS <= 0 or time.time() - self._last_idle_check < 600:
+            return
+        self._last_idle_check = time.time()
+        cutoff = time.time() - IDLE_SHUTDOWN_DAYS * 86400
+        live = {x["key"]: x for x in await asyncio.to_thread(live_sessions)}
+        done = 0
+        for key, st in list(sessions_state().items()):
+            s = live.get(key)
+            if (not s or done >= 4 or st.get("ended") or st.get("pending") or st.get("restarting")
+                    or st.get("hub") or s["status"] != "idle" or (st.get("subs") or {}).get("live")
+                    or proc_state(s["pid"]) == "T"):
+                continue
+            # NOT the transcript's mtime: something re-touches every transcript (all of them read
+            # "modified today" even when their last line is weeks old). The last entry's own
+            # timestamp is what counts.
+            last = max([await asyncio.to_thread(transcript_last_ts, s.get("transcript")),
+                        (s.get("updatedAt") or 0) / 1000, st.get("progress_at") or 0]
+                       + [e["at"] for e in st.get("inbox") or []])
+            if not last or last > cutoff:
+                continue
+            try:
+                await asyncio.to_thread(os.kill, s["pid"], signal.SIGTERM)
+            except OSError as e:
+                log_error(f"idle shutdown {key}", e)
+                continue
+            done += 1
+            st.update({"ended": True, "status": "ended", "ended_at": time.time(), "ended_reason": "idle",
+                       "card": None, "prompt_msg": None})
+            save_state()
+            print(f"idle shutdown: {st.get('name')} ({key}) idle since "
+                  f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(last))}", flush=True)
+            self.log_event(f"💤 {st.get('name', '?')} shut down (idle)")
+            thread = await self.get_thread(st.get("thread"))
+            if not thread:
+                continue
+            days = (time.time() - last) / 86400
+            try:
+                await thread.send(f"-# 💤 shut down after {days:.0f} days idle — history kept, one tap "
+                                  "brings it back", view=resurrect_view(key), allowed_mentions=NO_PING)
+                await thread.edit(name=ended_title(st.get("name", "")), archived=True)
+            except discord.HTTPException as e:
+                log_error("idle shutdown thread", e)
+
+    def heartbeat(self):
+        """For bin/chert-watchdog: proof the poll loop is still going round."""
+        try:
+            tmp = HEARTBEAT_FILE.with_name(HEARTBEAT_FILE.name + ".tmp")
+            tmp.write_text(json.dumps({"ts": time.time(), "pid": os.getpid(),
+                                       "sessions": len(sessions_state())}))
+            tmp.replace(HEARTBEAT_FILE)
+        except OSError as e:
+            log_error("heartbeat", e)
 
     async def after_reboot(self):
         dead = [(k, v) for k, v in sessions_state().items()
@@ -2709,8 +3469,8 @@ class Bridge(discord.Client):
     async def open_thread(self, channel, s, key):
         name = s["name"]
         cur = state.get(key)
-        if cur and cur.get("thread") and not cur.get("ended"):
-            return                        # something else already gave this session a thread
+        if cur and (cur.get("pending") or (cur.get("thread") and not cur.get("ended"))):
+            return                        # something else already gave (or is giving) it a thread
         collides = any(v.get("name") == name and not v.get("ended")
                        for v in sessions_state().values())
         title = thread_title(name, s["sid"], collides)
@@ -2718,9 +3478,10 @@ class Bridge(discord.Client):
             name=title, type=discord.ChannelType.public_thread,
             auto_archive_duration=10080)
         cur = state.get(key)
-        if cur and cur.get("thread") and cur["thread"] != thread.id and not cur.get("ended"):
-            # a restart/revive claimed this session while the thread was being created: keep
-            # its (original) thread and drop the duplicate we just made
+        if cur and (cur.get("pending") or (cur.get("thread") and cur["thread"] != thread.id
+                                           and not cur.get("ended"))):
+            # a summon/fork/restart/revive claimed this session while the thread was being
+            # created: keep its thread and drop the duplicate we just made
             try:
                 await thread.delete()
             except discord.HTTPException:
@@ -3070,6 +3831,9 @@ class Bridge(discord.Client):
         they appear. Returns (session|None, notes)."""
         notes, answered = [], Counter()
         deadline = time.time() + SPAWN_TIMEOUT
+        # the caller owns this pane's thread until it calls release_pane (or the claim lapses,
+        # and the poller adopts the session as a fallback)
+        self._claimed_panes[pane] = deadline + 60
         n = 0
         while time.time() < deadline:
             await asyncio.sleep(1.5)
@@ -3089,7 +3853,19 @@ class Bridge(discord.Client):
             elif LOGIN_RE.search(text):
                 notes.append("a **login** screen is up — that needs a human (`tmux select-window`)")
                 break
+        self.release_pane(pane)          # it may still register later: let the poller have it
         return None, notes
+
+    def release_pane(self, pane):
+        if pane:
+            self._claimed_panes.pop(pane, None)
+
+    def pane_claimed(self, pane):
+        exp = self._claimed_panes.get(pane) if pane else None
+        if exp and exp < time.time():
+            self._claimed_panes.pop(pane, None)
+            return False
+        return bool(exp)
 
     async def spawn_failure_text(self, pane, cwd, notes):
         alive = await asyncio.to_thread(pane_claude_alive, pane)
@@ -3130,35 +3906,28 @@ class Bridge(discord.Client):
                             allowed_mentions=NO_PING)
             return
         key = session["key"]
-        state[key] = {"pending": True}  # claim it before the poller opens a duplicate
-        save_state()
-        try:
-            title = thread_title(session["name"], session["sid"], False)
-            thread = await msg.create_thread(name=title, auto_archive_duration=10080)
-            intro = await thread.send(status_line(session), suppress_embeds=True,
-                                      allowed_mentions=NO_PING)
-        except discord.HTTPException as e:
-            state.pop(key, None)
-            save_state()
-            await msg.reply(f"⚠️ launched but couldn't open a thread: `{e}`",
+        # the thread hangs off the summoning message; adopt_session does the claiming, so the
+        # poller can't open a twin (and if it somehow won, its thread is reused)
+        on_msg = types.SimpleNamespace(
+            id=msg.channel.id,
+            create_thread=lambda name, auto_archive_duration, **_: msg.create_thread(
+                name=name, auto_archive_duration=auto_archive_duration))
+        thread = await self.adopt_session(session, on_msg, {"spawned": True})
+        if not thread:
+            await msg.reply("⚠️ launched but couldn't open a thread — the poller will pick it up",
                             allowed_mentions=NO_PING)
             return
-        size = os.path.getsize(session["transcript"]) if session["transcript"] else 0
-        state[key] = {"thread": thread.id, "parent": msg.channel.id,
-                      "status_msg": intro.id, "size": size, "status": session["status"],
-                      "name": session["name"], "sid": session["sid"],
-                      "cwd": session["cwd"], "thread_name": title,
-                      "ended": False, "muted": False, "spawned": True}
-        save_state()
         if notes:
             await self.say(thread, "\n".join(f"-# 🛠 {n}" for n in notes))
         payload = f"{prompt}\n{attached}".strip() if attached else prompt
+        entry = self.track_inbox(key, msg, payload)
         ok, serr = await asyncio.to_thread(self.deliver, session, msg.author, payload)
         print(f"summon by {msg.author} ({msg.author.id}) in #{msg.channel} -> "
               f"{cwd} pane {pane} key {key} ok={ok} gates={notes}")
         if ok:
-            await msg.add_reaction("📡")
+            self.sync_receipt_soon(entry)            # 📨 now; ⏳/👀/✅ follow from the transcript
         else:
+            self.drop_inbox(key, entry)
             await thread.send(f"⚠️ prompt not delivered: {serr}", allowed_mentions=NO_PING)
 
     async def save_attachments(self, msg):
@@ -3199,7 +3968,7 @@ class Bridge(discord.Client):
             print(f"retire_thread {thread.id} failed: {e}")
             return False
 
-    async def revive(self, key, st, thread, force=False, fork=False, reporter=None):
+    async def revive(self, key, st, thread, force=False, fork=False, reporter=None, mode=None):
         """Resume a pane-less (background), ended, or crashed session as a steerable
         tmux claude. The thread is moved onto the revived process, so the conversation
         continues in the same place. Returns the new session dict, or None."""
@@ -3246,7 +4015,7 @@ class Bridge(discord.Client):
                 await asyncio.sleep(1)
                 if not await asyncio.to_thread(find_live_by_key, key):
                     break
-        pane, err = await asyncio.to_thread(spawn_claude, name, cwd, sid, fork)
+        pane, err = await asyncio.to_thread(spawn_claude, name, cwd, sid, fork, "", None, mode)
         if not pane:
             await report(f"-# ❌ couldn't open a tmux window: `{err}` — is the tmux server "
                          f"(session `{TMUX_SESSION}`) running?")
@@ -3262,8 +4031,9 @@ class Bridge(discord.Client):
             "status": session["status"], "thread_name": title, "ended": False,
             "ended_at": None, "ended_reason": None,
             "size": os.path.getsize(session["transcript"]) if session["transcript"] else 0,
-            "tool_msg": None, "tool_run": None, "prompt_msg": None}
+            "tool_msg": None, "tool_run": None, "prompt_msg": None, "card": None}
         save_state()
+        self.release_pane(pane)
         await self.edit_status(state[session["key"]], session)
         if thread:
             try:
@@ -3272,6 +4042,7 @@ class Bridge(discord.Client):
                 pass
         await report(f"-# ♻️ revived in tmux pane `{pane}`"
                      + (" as a fork (new session id, original left running)" if fork else "")
+                     + (f" in **{MODE_ARG_WORD.get(mode, mode)}** mode" if mode else "")
                      + " — history intact, talk to it here"
                      + ("".join(f"\n-# 🛠 {n}" for n in notes) if notes else ""))
         return session
@@ -3523,10 +4294,23 @@ class Bridge(discord.Client):
         want = (want or "").strip().lower()
         label = self.MODE_LABELS.get(want)
         if not label:
-            return await respond(f"modes: {', '.join(self.MODE_LABELS)}")
+            await respond(f"modes: {', '.join(self.MODE_LABELS)}")
+            return False
         s = await asyncio.to_thread(find_live_by_key, key)
         if not s or not s.get("pane"):
-            return await respond("-# needs a live session with a tmux pane")
+            await respond("-# needs a live session with a tmux pane")
+            return False
+        if want == "default":
+            # default mode has no label of its own on the footer: it is "none of the others"
+            for attempt in range(7):
+                info = await asyncio.to_thread(screen_info, s["pane"])
+                if info["mode"] == "default":
+                    await respond(f"✅ **{s['name']}** is now in **default** mode (asks before acting)")
+                    return True
+                await asyncio.to_thread(checkin.send_to_session, s, None, "BTab")
+                await asyncio.sleep(0.8)
+            await respond("⚠️ pressed shift+tab 7× without reaching default mode")
+            return False
 
         def bottom():
             lines = [l.strip() for l in screen_text(s["pane"], 700).splitlines() if l.strip()]
@@ -3538,15 +4322,80 @@ class Bridge(discord.Client):
             seen.append(b[-60:])
             if label in b:
                 on = "classifier **off**" if want == "bypass" else ("classifier **on**" if want == "auto" else "")
-                return await respond(f"✅ **{s['name']}** is now in **{want}** mode"
-                                     + (f" — {on}" if on else "")
-                                     + (f" (after {attempt} shift+tab)" if attempt else " (already was)"))
+                await respond(f"✅ **{s['name']}** is now in **{want}** mode"
+                              + (f" — {on}" if on else "")
+                              + (f" (after {attempt} shift+tab)" if attempt else " (already was)"))
+                return True
             await asyncio.to_thread(checkin.send_to_session, s, None, "BTab")
             await asyncio.sleep(0.8)
         hint = (" — bypass isn't in this session's cycle (launched without "
                 "--allow-dangerously-skip-permissions); `!restart` it and try again" if want == "bypass" else "")
         await respond(f"⚠️ pressed shift+tab 7× without seeing **{label}**{hint}. Bottom line now: "
                       f"`{seen[-1][:120]}`")
+        return False
+
+    # ---------- per-session yolo: bypass for a while, then back to the mode it had ----------
+
+    async def session_yolo(self, key, st, respond, secs):
+        """`/yolo 1h` in a session's thread: THIS claude goes to bypassPermissions (everything
+        allowed, classifier off) right now, and tick_session switches it back to the mode it had
+        when the time is up. `secs=None` ends it early. A claude whose shift+tab cycle has no
+        bypass (started by hand without --allow-dangerously-skip-permissions) is restarted in
+        place in bypass when it is idle — history kept."""
+        s = await asyncio.to_thread(find_live_by_key, key)
+        if not s or not s.get("pane"):
+            return await respond("-# 👻 needs a live session with a tmux pane — `/revive` it first")
+        if secs is None:
+            y = st.pop("yolo", None)
+            save_state()
+            if not y:
+                return await respond(f"-# **{s['name']}** isn't in yolo — nothing to end")
+            return await self.end_session_yolo(key, st, y, respond, early=True)
+        y = st.get("yolo")
+        if y and y.get("until", 0) > time.time():
+            y["until"] = time.time() + secs              # extend, keep the mode to go back to
+            save_state()
+            await self.edit_status(st, s)
+            return await respond(f"🎲 yolo for **{s['name']}** extended to <t:{int(y['until'])}:t> "
+                                 f"(<t:{int(y['until'])}:R>), then back to **{y['prev']}**")
+        cur = (await asyncio.to_thread(screen_info, s["pane"]))["mode"]
+        prev = cur if cur not in ("bypass", "") else MODE_ARG_WORD.get(PERMISSION_MODE, "auto")
+        notes = []
+        ok = await self.cycle_mode(key, st, lambda t: _collect(notes, t), "bypass")
+        if not ok:
+            if s["status"] in ("busy", "shell", "waiting"):
+                return await respond(f"⚠️ bypass isn't in **{s['name']}**'s shift+tab cycle and it's "
+                                     f"**{s['status']}** — try again when it's idle (I'll restart it in "
+                                     "place in bypass then)\n" + "\n".join(f"-# {n}" for n in notes))
+            await respond(f"-# bypass isn't in **{s['name']}**'s shift+tab cycle — restarting it in "
+                          "place in bypass (history kept)")
+            thread = await self.get_thread(st.get("thread"))
+            sess = await self.restart_session(key, st, thread, respond, mode="bypassPermissions")
+            if not sess:
+                return
+            key, st = sess["key"], state[sess["key"]]
+        st["yolo"] = {"until": time.time() + secs, "prev": prev}
+        save_state()
+        live = await asyncio.to_thread(find_live_by_key, key)
+        if live:
+            await self.edit_status(st, live)
+        await respond(f"🎲 **{s['name']}** is in **bypass** (everything allowed, classifier off) until "
+                      f"<t:{int(st['yolo']['until'])}:t> (<t:{int(st['yolo']['until'])}:R>), then back to "
+                      f"**{prev}**. `/yolo off` ends it early.")
+
+    async def end_session_yolo(self, key, st, y, respond, early=False):
+        prev = (y or {}).get("prev") or "auto"
+        notes = []
+        ok = await self.cycle_mode(key, st, lambda t: _collect(notes, t), prev)
+        name = st.get("name") or "?"
+        if ok:
+            await respond(f"-# 🔒 yolo {'ended' if early else 'over'} — **{name}** is back in **{prev}** mode")
+        else:
+            await respond(f"⚠️ yolo {'ended' if early else 'over'} but I couldn't switch **{name}** back to "
+                          f"**{prev}** — `/mode {prev}` by hand\n" + "\n".join(f"-# {n}" for n in notes))
+        live = await asyncio.to_thread(find_live_by_key, key)
+        if live:
+            await self.edit_status(st, live)
 
     def privileged(self, user):
         """Owner-only commands (/model, /globalmodel): they change which model — and so what
@@ -3761,7 +4610,9 @@ class Bridge(discord.Client):
           1. not live (ended/crashed/background) → revive it into tmux.
           2. live and busy/waiting → send Esc (twice; the first may just close a dialog) and
              see if it comes back idle. Usually enough for a hung turn or a stuck prompt.
-          3. still frozen → in-place restart with force (clean exit + `claude -r`, history kept).
+          3. still frozen → in-place restart with force (clean exit + `claude -r`, history kept)
+             in bypassPermissions: a claude wedged by auto-mode classifier blocks must not come
+             back into the same trap. `/mode auto` (or `/yolo`) puts the classifier back.
           A claude that is idle and wrote to its transcript recently is not stuck: say so and
           only deliver `message`, unless `force`. After any successful unstick, deliver `message`."""
         s = await asyncio.to_thread(find_live_by_key, key)
@@ -3775,14 +4626,15 @@ class Bridge(discord.Client):
             await respond("📨 your message was delivered" if ok else f"⚠️ message not delivered: {err}")
 
         if not s:
-            await respond(f"🔄 **{name}** isn't live — reviving it instead")
-            sess = await self.revive(key, st, channel, force=True, reporter=respond)
+            await respond(f"🔄 **{name}** isn't live — reviving it instead, in **bypass** mode")
+            sess = await self.revive(key, st, channel, force=True, reporter=respond, mode=UNSTICK_MODE)
             if sess:
                 await send(sess)
             return
         if not s.get("pane"):
-            await respond(f"🔄 **{name}** has no tmux pane (background) — reviving it into tmux")
-            sess = await self.revive(key, st, channel, force=True, reporter=respond)
+            await respond(f"🔄 **{name}** has no tmux pane (background) — reviving it into tmux, "
+                          "in **bypass** mode")
+            sess = await self.revive(key, st, channel, force=True, reporter=respond, mode=UNSTICK_MODE)
             if sess:
                 await send(sess)
             return
@@ -3806,14 +4658,15 @@ class Bridge(discord.Client):
                                   f"**{s2['status']}** again, history intact")
                     await send(s2)
                     return
-        await respond(f"⚠️ still stuck after Esc — restarting **{name}** in place "
-                      "(clean exit + `claude -r`, history kept)"
-                      + (" — this also kills the shell job it was watching" if s["status"] == "shell" else ""))
-        sess = await self.restart_session(key, st, channel, respond, force=True)
+        await respond(f"⚠️ still stuck after Esc — restarting **{name}** in place in **bypass** mode "
+                      "(everything allowed, no classifier; clean exit + `claude -r`, history kept)"
+                      + (" — this also kills the shell job it was watching" if s["status"] == "shell" else "")
+                      + "\n-# `/mode auto` turns the classifier back on")
+        sess = await self.restart_session(key, st, channel, respond, force=True, mode=UNSTICK_MODE)
         if sess:
             await send(sess)
 
-    async def restart_session(self, key, st, thread, respond, force=False):
+    async def restart_session(self, key, st, thread, respond, force=False, mode=None):
         """Restart a live tmux session IN PLACE: clean SIGTERM (flushes the transcript),
         then `claude -r <sid>` with its original flags typed into the same pane, thread
         moved onto the new process. Used to pick up new settings, keys or hooks — a
@@ -3821,7 +4674,8 @@ class Bridge(discord.Client):
 
         Refuses busy/shell sessions unless forced: a `shell` session has a child process
         (background job, tunnel) that dies with it. Also refuses a pane that hosts more
-        than one claude, since killing one would just foreground the other.
+        than one claude, since killing one would just foreground the other. `mode` relaunches
+        it in that permission mode (e.g. bypassPermissions) instead of the one it had.
         Returns the new session dict or None."""
         s = await asyncio.to_thread(find_live_by_key, key)
         if not s:
@@ -3847,7 +4701,7 @@ class Bridge(discord.Client):
                           f"({', '.join(x['name'] for x in siblings)}) — restart that one by hand")
             return None
         argv = await asyncio.to_thread(claude_argv, s["pid"])
-        flags = restart_flags(argv) if argv else spawn_flags()
+        flags = with_mode(restart_flags(argv) if argv else spawn_flags(), mode)
         sid, name, pane = s["sid"], s["name"], s["pane"]
         crons = await asyncio.to_thread(session_crons, s.get("transcript"))
         st["restarting"] = True
@@ -3887,10 +4741,12 @@ class Bridge(discord.Client):
             **old, "sid": session["sid"], "name": session["name"], "cwd": session["cwd"],
             "status": session["status"], "thread_name": title, "ended": False,
             "size": os.path.getsize(session["transcript"]) if session["transcript"] else 0,
-            "tool_msg": None, "tool_run": None, "prompt_msg": None, "subs": None}
+            "tool_msg": None, "tool_run": None, "prompt_msg": None, "subs": None, "card": None}
         save_state()
+        self.release_pane(pane)
         await self.edit_status(state[session["key"]], session)
         await respond(f"-# ♻️ **{session['name']}** restarted in place — pane `{pane}`, history intact"
+                      + (f", now in **{MODE_ARG_WORD.get(mode, mode)}** mode" if mode else "")
                       + ("".join(f"\n-# 🛠 {n}" for n in notes) if notes else ""))
         if crons:
             listing = "\n".join(f"- `{c['cron']}`{'' if c['recurring'] else ' (one-shot)'}: {c['prompt']}"
@@ -4182,11 +5038,18 @@ class Bridge(discord.Client):
             await run_as_text(interaction, text, "thread")
 
         # anywhere
-        @tree.command(name="yolo", description="bypassPermissions for sessions started in the next while, or off")
+        @tree.command(name="yolo", description="Bypass (everything allowed) for a while: this session, "
+                                               "or every new one")
         @discord.app_commands.default_permissions(administrator=True)
-        @discord.app_commands.describe(duration="e.g. 30m, 1h, 90s (max 12h), or off")
-        async def yolo_cmd(interaction: discord.Interaction, duration: str):
-            await run_as_text(interaction, f"!yolo {duration.strip()}", "here")
+        @discord.app_commands.describe(duration="e.g. 30m, 1h, 90s (max 12h), or off",
+                                       everywhere="every claude started in that window instead of this one")
+        async def yolo_cmd(interaction: discord.Interaction, duration: str = "1h", everywhere: bool = False):
+            text = f"!yolo {duration.strip()}" + (" everywhere" if everywhere else "")
+            await run_as_text(interaction, text, "here")
+
+        @tree.command(name="stop", description="Interrupt this session's running turn (the terminal's Esc)")
+        async def stop_cmd(interaction: discord.Interaction):
+            await run_as_text(interaction, "!stop", "thread")
 
         @tree.command(name="help", description="Everything chert can do")
         async def help_cmd(interaction: discord.Interaction):
@@ -4836,6 +5699,7 @@ class Bridge(discord.Client):
         if existing and existing.get("thread") and not existing.get("pending"):
             existing.update(extra or {})
             save_state()
+            self.release_pane(session.get("pane"))
             return await self.get_thread(existing["thread"])
         state[nkey] = {"pending": True}
         save_state()
@@ -4849,6 +5713,7 @@ class Bridge(discord.Client):
             log_error("adopt_session", e)
             state.pop(nkey, None)
             save_state()
+            self.release_pane(session.get("pane"))
             return None
         state[nkey] = {"thread": thread.id, "parent": parent.id, "status_msg": intro.id,
                        "size": os.path.getsize(session["transcript"]) if session["transcript"] else 0,
@@ -4856,6 +5721,7 @@ class Bridge(discord.Client):
                        "cwd": session["cwd"], "thread_name": title, "ended": False, "muted": False,
                        **(extra or {})}
         save_state()
+        self.release_pane(session.get("pane"))
         if ANNOUNCE_NEW and self.main_channel:
             await self.say(self.main_channel,
                            f"🚀 **new traveler:** **{session['name']}** · `{session['project']}` · "
@@ -5203,7 +6069,37 @@ class Bridge(discord.Client):
                                        force="force" in low)
             return
         if low.startswith("!yolo"):
-            await self.handle_yolo(msg, content)
+            # in a session's thread: THIS claude, for a while. `everywhere` = the old fleet-wide
+            # yolo (bypass for every claude started in that window)
+            words = content[5:].split()
+            if any(w.lower() in ("everywhere", "all", "new") for w in words):
+                rest = " ".join(w for w in words if w.lower() not in ("everywhere", "all", "new"))
+                await self.handle_yolo(msg, f"!yolo {rest}".strip())
+                return
+            if not self.privileged(msg.author):
+                await self.say(msg.channel, "-# 🔐 yolo is owner-only")
+                return
+            arg = " ".join(words) or "1h"
+            await msg.add_reaction("🎲")
+            say = lambda t: self.say(msg.channel, t)  # noqa: E731
+            if arg.lower() in ("off", "stop", "end"):
+                await self.session_yolo(key, st, say, None)
+                return
+            secs = parse_duration(arg)
+            if not secs or secs > YOLO_MAX:
+                await self.say(msg.channel, "`/yolo 1h` · `/yolo 30m` · `/yolo off` — this session, max 12h · "
+                                            "`/yolo 1h everywhere` = every claude started in the next hour")
+                return
+            await self.session_yolo(key, st, say, secs)
+            return
+        if low == "!stop" or low == "!interrupt":
+            # the terminal's Esc: stops the running turn (thinking, a tool, a reply)
+            s0 = await asyncio.to_thread(find_live_by_key, key)
+            if not s0 or not reach(s0):
+                await msg.add_reaction("👻")
+                return
+            ok, _ = await asyncio.to_thread(checkin.send_to_session, s0, None, "Escape")
+            await msg.add_reaction("⏹" if ok else "❌")
             return
         if low.startswith("!log"):
             arg = content[4:].strip()
@@ -5257,11 +6153,16 @@ class Bridge(discord.Client):
         # attribute it: several humans and bots share these threads now, and a bare
         # paste gave the claude no way to tell who it was talking to
         payload = f"{content}\n{attached}".strip() if attached else content
+        # read receipts, as reactions (they never notify): 📨 typed in → ⏳ queued behind the
+        # running turn → 👀 Claude took it in → ✅ that turn finished. Registered BEFORE typing,
+        # so the transcript can't get ahead of us.
+        entry = self.track_inbox(key, msg, payload)
         ok, err = await asyncio.to_thread(self.deliver, s, msg.author, payload)
-        # 🤔 = delivered, claude is chewing on it (📨 = delivered over the inbox socket of a
-        # background session). A reaction instead of a reply, so acknowledging your own
-        # message never notifies you.
-        await msg.add_reaction(("🤔" if s["pane"] else "📨") if ok else "❌")
+        if ok:
+            self.sync_receipt_soon(entry)
+        else:
+            self.drop_inbox(key, entry)
+            await msg.add_reaction("❌")
         if err:
             await msg.channel.send(f"-# ⚠️ {err}", allowed_mentions=NO_PING)
 
@@ -5269,6 +6170,11 @@ class Bridge(discord.Client):
 def main():
     if not TOKEN or not CHANNEL_ID:
         sys.exit("DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID must be set (see .env)")
+    lock = open(str(STATE_FILE) + ".lock", "a")       # held for the life of the process
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(f"another bridge is already running here ({STATE_FILE}.lock is held)")
     load_state()
     intents = discord.Intents.default()
     intents.message_content = True

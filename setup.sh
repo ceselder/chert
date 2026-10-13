@@ -73,17 +73,17 @@ if (( DRY )); then echo "  [dry-run] would run hooks/install_hooks.py"; else "$V
 
 say "7/7 systemd units"
 mkdir -p systemd/rendered
-for tpl in systemd/templates/*.service.in; do
+for tpl in systemd/templates/*.in; do
   unit="$(basename "${tpl%.in}")"
   sed -e "s|@USER@|$ME|g" -e "s|@HOME@|$HOME_DIR|g" -e "s|@APP@|$APP|g" -e "s|@VENV@|$VENV|g" "$tpl" > "systemd/rendered/$unit"
 done
 ok "rendered $(ls systemd/rendered | wc -l) units for user $ME at $APP → systemd/rendered/"
 if (( NO_SYSTEMD || DRY )) || ! command -v systemctl >/dev/null; then
-  echo "  install them yourself:"; echo "    sudo cp systemd/rendered/*.service /etc/systemd/system/ && sudo systemctl daemon-reload"
-  echo "    sudo systemctl enable --now chert-tmux chert-discord-bridge chert-checkin"
+  echo "  install them yourself:"; echo "    sudo cp systemd/rendered/*.service systemd/rendered/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload"
+  echo "    sudo systemctl enable --now chert-tmux chert-discord-bridge chert-checkin chert-watchdog.timer"
 elif sudo -n true 2>/dev/null || [[ -t 0 ]]; then
-  sudo cp systemd/rendered/*.service /etc/systemd/system/ && sudo systemctl daemon-reload
-  sudo systemctl enable --now chert-tmux chert-discord-bridge chert-checkin
+  sudo cp systemd/rendered/*.service systemd/rendered/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload
+  sudo systemctl enable --now chert-tmux chert-discord-bridge chert-checkin chert-watchdog.timer
   sleep 3
   for u in chert-tmux chert-discord-bridge chert-checkin; do printf '  %-22s %s\n' "$u" "$(systemctl is-active "$u")"; done
   echo "  logs:  journalctl -u chert-discord-bridge -f"

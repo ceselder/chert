@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""chert-watchdog: get a wedged chert bridge going again without a human.
+
+Run every two minutes by a systemd timer, as the same user as the bridge. The bridge rewrites
+its heartbeat file at the end of every poll loop (every few seconds).
+
+  1. heartbeat fresh                       -> nothing to do
+  2. stale > WATCHDOG_STALE_SECS, unit up  -> SIGTERM the bridge (SIGKILL after 20 s); systemd's
+                                              Restart=always brings it back. Post a note.
+  3. still stale after WATCHDOG_RESTARTS restarts in the last hour, or the unit has failed
+                                           -> spawn a fixer claude in tmux in bypassPermissions
+                                              (everything allowed) whose job is to find the cause,
+                                              fix chert and get the heartbeat fresh again.
+                                              One per WATCHDOG_FIXER_COOLDOWN; pings the owner.
+
+A unit that is merely inactive (someone ran `systemctl stop`, e.g. to edit bot_state.json) is
+left alone, and so is everything while ~/.claude/chert-watchdog.pause exists.
+
+Config comes from the bridge's .env (the unit's EnvironmentFile): CHERT_UNIT (default
+chert-discord-bridge), DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID / DISCORD_OWNER_ID for the notes,
+TMUX_SESSION, CLAUDE_BIN, HEARTBEAT_FILE. `chert-watchdog --status` prints what it sees.
+"""
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+APP = Path(__file__).resolve().parent.parent
+UNIT = os.environ.get("CHERT_UNIT", "chert-discord-bridge")
+HEARTBEAT = Path(os.environ.get("HEARTBEAT_FILE", str(HOME / ".claude" / "chert-heartbeat")))
+STATE = HOME / ".claude" / "chert-watchdog.json"
+PAUSE = HOME / ".claude" / "chert-watchdog.pause"
+LOG = HOME / ".claude" / "chert-watchdog.log"
+STALE = int(os.environ.get("WATCHDOG_STALE_SECS", "360"))
+RESTARTS = int(os.environ.get("WATCHDOG_RESTARTS", "2"))
+COOLDOWN = int(os.environ.get("WATCHDOG_FIXER_COOLDOWN", str(6 * 3600)))
+TMUX_SESSION = os.environ.get("TMUX_SESSION", "0")
+CLAUDE_BIN = (os.environ.get("CLAUDE_BIN") or shutil.which("claude")
+              or str(HOME / ".local" / "bin" / "claude"))
+FIXER = "chert-fixer"
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def run(args, timeout=30):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {"restarts": [], "fixer_at": 0}
+
+
+def save_state(st):
+    tmp = STATE.with_name(STATE.name + ".tmp")
+    tmp.write_text(json.dumps(st))
+    tmp.replace(STATE)
+
+
+def unit_info():
+    rc, out = run(["systemctl", "show", UNIT, "-p", "ActiveState", "-p", "SubState", "-p", "MainPID",
+                   "-p", "ActiveEnterTimestampMonotonic"])
+    info = dict(l.split("=", 1) for l in out.splitlines() if "=" in l) if rc == 0 else {}
+    return info
+
+
+def heartbeat_age():
+    try:
+        return time.time() - json.loads(HEARTBEAT.read_text())["ts"]
+    except (OSError, ValueError, KeyError):
+        try:
+            return time.time() - HEARTBEAT.stat().st_mtime
+        except OSError:
+            return None
+
+
+def uptime_of(pid):
+    """Seconds the bridge process has been running (a fresh restart has no heartbeat yet)."""
+    try:
+        start_ticks = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        boot_up = float(Path("/proc/uptime").read_text().split()[0])
+        return boot_up - start_ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def note(text, ping=False):
+    """A line in the bridge's main channel via the bot's REST API (works while the bridge's own
+    process is wedged), and notify-discord if it is configured."""
+    token, chan = os.environ.get("DISCORD_BOT_TOKEN"), os.environ.get("DISCORD_CHANNEL_ID")
+    owner = os.environ.get("DISCORD_OWNER_ID", "")
+    if ping and not owner and token and chan:
+        owner = guild_owner(token, chan)          # same default as the bridge: the server owner
+    if token and chan:
+        body = {"content": (f"<@{owner}> " if ping and owner else "") + text,
+                "allowed_mentions": {"users": [owner] if ping and owner else []}}
+        req = urllib.request.Request(
+            f"https://discord.com/api/v10/channels/{chan}/messages", data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bot {token}", "Content-Type": "application/json",
+                     "User-Agent": "chert-watchdog (https://github.com/ceselder/chert, 1)"})
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except OSError as e:
+            log(f"discord note failed: {e}")
+    nd = shutil.which("notify-discord") or str(HOME / ".local" / "bin" / "notify-discord")
+    if os.environ.get("DISCORD_WEBHOOK_URL") and os.access(nd, os.X_OK):
+        run([nd, text])
+
+
+def guild_owner(token, chan):
+    def get(path):
+        req = urllib.request.Request(f"https://discord.com/api/v10{path}", headers={
+            "Authorization": f"Bot {token}", "User-Agent": "chert-watchdog (https://github.com/ceselder/chert, 1)"})
+        return json.loads(urllib.request.urlopen(req, timeout=15).read())
+    try:
+        return str(get(f"/guilds/{get(f'/channels/{chan}')['guild_id']}")["owner_id"])
+    except (OSError, ValueError, KeyError):
+        return ""
+
+
+def restart_bridge(pid):
+    """Kill the wedged process; systemd's Restart=always starts a fresh one."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        log(f"SIGTERM {pid} failed: {e}")
+        return False
+    for _ in range(20):
+        time.sleep(1)
+        if not Path(f"/proc/{pid}").exists():
+            return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    return True
+
+
+def fixer_alive():
+    rc, out = run(["tmux", "list-windows", "-a", "-F", "#{window_name}"])
+    return rc == 0 and FIXER in out.split()
+
+
+def fixer_prompt(age, info, restarts):
+    jcmd = f"journalctl -u {UNIT} -n 300 --no-pager"
+    _, tail = run(["journalctl", "-u", UNIT, "-n", "40", "--no-pager"])
+    what = (f"its heartbeat ({HEARTBEAT}) is {int(age)} s old" if age is not None
+            else f"it has no heartbeat file ({HEARTBEAT})")
+    return (
+        f"[chert-watchdog] The chert Discord bridge (systemd unit {UNIT}, code in {APP}) is stuck: "
+        f"{what}; unit state {info.get('ActiveState', '?')}/{info.get('SubState', '?')}. I already "
+        f"restarted it {restarts} time(s) in the last hour and that did not help.\n\n"
+        "You were started in bypassPermissions mode so nothing blocks you. Your job:\n"
+        f"1. Find out why. Start with `{jcmd}` (use sudo if you need it), `systemctl status {UNIT}`, "
+        "the heartbeat file, disk space, and whether Discord answers.\n"
+        "2. Fix the cause with the smallest change that works: the code or config in "
+        f"{APP}, or the environment (disk full, a bad token, a dead tmux server...).\n"
+        f"3. Restart the unit and check the heartbeat is rewritten every few seconds again.\n"
+        f"4. Commit a code fix locally in {APP} with a clear message — do NOT push; the owner reviews. "
+        "Then say in two lines what was wrong and what you changed (and run `notify-discord` with "
+        "that summary if the command exists).\n\n"
+        f"Last journal lines:\n{tail[-3000:]}")
+
+
+def spawn_fixer(prompt):
+    flags = "--allow-dangerously-skip-permissions --permission-mode bypassPermissions"
+    inner = (f"CLAUDE_INSTANCE_NAME={FIXER} {shlex.quote(CLAUDE_BIN)} {flags} -n {FIXER} "
+             f"{shlex.quote(prompt)}; echo '[claude exited — window kept for inspection]'; exec bash")
+    args = ["tmux", "new-window", "-d", "-t", f"{TMUX_SESSION}:", "-n", FIXER, "-c", str(APP),
+            f"bash -lc {shlex.quote(inner)}"]
+    rc, out = run(args)
+    if rc != 0:                      # no tmux server: start one, then try again
+        run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-c", str(HOME)])
+        rc, out = run(args)
+    return rc == 0, out
+
+
+def main():
+    info = unit_info()
+    age = heartbeat_age()
+    st = load_state()
+    now = time.time()
+    st["restarts"] = [t for t in st.get("restarts", []) if now - t < 3600]
+    active, sub = info.get("ActiveState", "unknown"), info.get("SubState", "")
+    pid = int(info.get("MainPID") or 0)
+    if "--status" in sys.argv:
+        print(f"unit {UNIT}: {active}/{sub} pid {pid} · heartbeat "
+              f"{'missing' if age is None else f'{int(age)} s old'} (stale after {STALE} s) · "
+              f"restarts in the last hour: {len(st['restarts'])} · fixer alive: {fixer_alive()} · "
+              f"paused: {PAUSE.exists()}")
+        return
+    if PAUSE.exists():
+        return
+    if active in ("inactive", "deactivating") and not st["restarts"]:
+        return                                    # stopped on purpose — not ours to fight
+    if active == "active" and age is not None and age < STALE:
+        if st["restarts"] and now - st["restarts"][-1] > 600:
+            log(f"bridge healthy again (heartbeat {int(age)} s old)")
+            st["restarts"] = []
+            save_state(st)
+        return
+    up = uptime_of(pid) if pid else None
+    if active in ("active", "activating") and up is not None and up < STALE:
+        return                                    # just (re)started: give it time to beat
+    needs_fixer = active == "failed" or len(st["restarts"]) >= RESTARTS
+    if not needs_fixer and pid and active == "active":
+        log(f"bridge wedged: heartbeat {'missing' if age is None else f'{int(age)} s old'} — "
+            f"restarting pid {pid}")
+        restart_bridge(pid)
+        st["restarts"].append(now)
+        save_state(st)
+        note(f"🩺 chert was stuck (no heartbeat for {int(age or 0) // 60} min) — restarted it "
+             f"({len(st['restarts'])}/{RESTARTS} this hour before a fixer claude is called)")
+        return
+    if fixer_alive():
+        return
+    if now - st.get("fixer_at", 0) < COOLDOWN:
+        log("bridge still stuck, fixer cooldown active — waiting")
+        return
+    ok, out = spawn_fixer(fixer_prompt(age, info, len(st["restarts"])))
+    st["fixer_at"] = now
+    save_state(st)
+    log(f"spawned fixer claude: ok={ok} {out}")
+    note(("🩺 chert is still stuck after restarts — started a fixer claude (bypass mode) in tmux "
+          f"window `{FIXER}` to diagnose and fix it") if ok else
+         f"🩺 chert is stuck and I couldn't start a fixer claude: `{out[:200]}`", ping=True)
+
+
+if __name__ == "__main__":
+    main()
