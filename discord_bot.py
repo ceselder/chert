@@ -581,7 +581,23 @@ def settings_default_mode():
         return None
 
 
-PERMISSION_MODE = os.environ.get("PERMISSION_MODE") or settings_default_mode() or "auto"
+PERMISSION_MODES = {"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"}
+# systemd's EnvironmentFile keeps a trailing "# comment" as part of the value, so cut it off
+ENV_PERMISSION_MODE = os.environ.get("PERMISSION_MODE", "").split("#")[0].strip()
+PERMISSION_MODE = ENV_PERMISSION_MODE or settings_default_mode() or "auto"
+
+
+def apply_permission_mode():
+    """PERMISSION_MODE from .env is the box default: write it into settings.json, which is
+    where every claude chert starts or restarts reads its mode from. Blank = leave it alone."""
+    if not ENV_PERMISSION_MODE:
+        return
+    if ENV_PERMISSION_MODE not in PERMISSION_MODES:
+        print(f"PERMISSION_MODE={ENV_PERMISSION_MODE!r} is not a permission mode — ignored")
+        return
+    if settings_default_mode() != ENV_PERMISSION_MODE:
+        prev = set_default_mode(ENV_PERMISSION_MODE)
+        print(f"permissions.defaultMode: {prev} -> {ENV_PERMISSION_MODE} (PERMISSION_MODE)")
 
 
 def yolo_active():
@@ -6530,6 +6546,7 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         sys.exit(f"another bridge is already running here ({STATE_FILE}.lock is held)")
+    apply_permission_mode()
     load_state()
     intents = discord.Intents.default()
     intents.message_content = True

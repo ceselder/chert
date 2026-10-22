@@ -215,6 +215,7 @@ defaults; `setup.sh` fills in the Discord ones. Settings you may want to change:
 | `DASHBOARD_URL` | `http://127.0.0.1:8899/claudes` | Where you serve the dashboard, so its links work from Discord. |
 | `PROJECT_ROOT` | your home directory | Where `/claude … project` looks for directories. |
 | `SPAWN_FLAGS` | `--allow-dangerously-skip-permissions --effort xhigh` | Flags for sessions chert starts. |
+| `PERMISSION_MODE` | settings.json's `defaultMode` | Permission mode for sessions chert starts, e.g. `bypassPermissions`. Written into `~/.claude/settings.json` at startup. |
 | `SPAWN_ALLOW_USERS` | anyone in the server | Comma-separated Discord user ids allowed to start sessions. |
 | `DISCORD_OWNER_ID` | the server owner | Who gets pinged and who can use `/model` and `/globalmodel`. |
 | `REPORTS_URL` | none | A web server that serves `REPORTS_DIR`. Without it, reports are linked by file path. |
