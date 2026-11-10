@@ -339,6 +339,13 @@ NO_PANE_HELP = (
     "here.")
 
 NO_PING = discord.AllowedMentions.none()
+# A session reply whose first line starts with "🚧 BLOCKED" (markdown/emoji around it allowed)
+# @-pings the owner: sessions say they are stuck in plain text instead of a multiple-choice menu.
+BLOCKED_RE = re.compile(r"^[\s*_>#`~|-]*(?:🚧\uFE0F?[\s*_]*(?i:blocked)|BLOCKED)\b")
+
+
+def is_blocked_msg(text):
+    return bool(BLOCKED_RE.match(text or ""))
 # keyed by "<pid>:<procStart>" (a claude's stable process identity) ->
 # {thread, parent, status_msg, size, status, name, sid, cwd, ended, ended_at,
 #  ended_reason, muted, tool_msg, tool_run, prompt_msg, spawned}; "_meta" -> {...}
@@ -2648,15 +2655,21 @@ class Bridge(discord.Client):
         except discord.HTTPException as e:
             print(f"webhook {wh.id}: avatar edit failed ({e})", flush=True)
 
-    async def post_as(self, channel, name, content, thread_id=None, seed=None, view=None):
+    async def post_as(self, channel, name, content, thread_id=None, seed=None, view=None,
+                      ping_owner=False):
         """Post under a per-agent identity via the channel webhook. Returns the message.
 
         `seed` fixes the avatar to something stable (a session's pid:procStart). `view` adds
-        buttons (allowed because the bot itself created the webhook).
+        buttons (allowed because the bot itself created the webhook). `ping_owner` puts an
+        @mention of the owner in front and lets that one mention through.
         """
         wh = await self.webhook_for(channel)
+        mentions = NO_PING
+        if ping_owner and self.owner:
+            content = f"<@{self.owner}> {content}"
+            mentions = discord.AllowedMentions(users=[discord.Object(id=self.owner)])
         kwargs = dict(content=content[:2000], username=name[:WEBHOOK_NAME_MAX],
-                      allowed_mentions=NO_PING, suppress_embeds=True, wait=True)
+                      allowed_mentions=mentions, suppress_embeds=True, wait=True)
         if view is not None:
             kwargs["view"] = view
         if avatar_bytes() is None:
@@ -2715,7 +2728,9 @@ class Bridge(discord.Client):
             st["tool_msg"] = m.id if m else None
             st["tool_run"] = dict(payload)
         else:
-            await self.post_as(parent, webhook_name(s), payload, st["thread"], seed=s["key"])
+            # "🚧 BLOCKED: …" = the session needs you; ping instead of a multiple-choice menu
+            await self.post_as(parent, webhook_name(s), payload, st["thread"], seed=s["key"],
+                               ping_owner=kind == "msg" and is_blocked_msg(payload))
             st["tool_msg"] = None
             st["tool_run"] = None
 

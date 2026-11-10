@@ -35,6 +35,9 @@ writes, receives Claude Code hook events, and types into sessions through tmux.
 - Reactions on your messages show where each one is: 📨 typed in, ⏳ queued behind the running
   turn, 👀 read by Claude, ✅ answered, ⚠️ stuck in the input box.
 - Permission prompts and menus appear as buttons.
+- A session reply whose first line starts with `🚧 BLOCKED` @-pings you. You can deny Claude Code's
+  multiple-choice tool (`"permissions": {"deny": ["AskUserQuestion"]}`) and have sessions say in
+  plain text what they need.
 - Slash commands start, fork, rename and unstick sessions, and change their model, effort or
   permission mode.
 - A message in `#all-claudes` goes to every live session. A summarizer session collects the
