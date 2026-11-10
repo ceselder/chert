@@ -51,6 +51,7 @@ import shlex
 import shutil
 import signal
 import struct
+import zlib
 import subprocess
 import sys
 import time
@@ -1036,7 +1037,7 @@ def subagent_progress(transcript, aid):
         cut = data.rfind(b"\n") + 1
         ent["off"] += cut
         for line in data[:cut].splitlines():
-            if b'"tool_use"' not in line:
+            if b'"assistant"' not in line:
                 continue
             try:
                 r = json.loads(line)
@@ -1044,48 +1045,142 @@ def subagent_progress(transcript, aid):
                 continue
             if r.get("type") != "assistant":
                 continue
+            ent["ended"] = (r.get("message") or {}).get("stop_reason") == "end_turn"
+            if (r.get("message") or {}).get("model", "").startswith("claude-"):
+                ent["model"] = r["message"]["model"]   # what actually served it (meta.json's
+                #                                        pickedEffortModel is the parent's model)
             for blk in (r.get("message") or {}).get("content") or []:
                 if isinstance(blk, dict) and blk.get("type") == "tool_use":
                     ent["tools"] += 1
-                    name, summ = checkin.tool_summary(blk)
-                    ent["last"] = f"{'$ ' if name == 'Bash' else name + ' '}{_clean(summ, 80)}"
+                    ent["last"] = sub_action(blk)
+    ent["mtime"] = path.stat().st_mtime if path.exists() else ent.get("mtime")
     if len(_SUB_PROGRESS) > 400:
         _SUB_PROGRESS.clear()
     return ent
 
 
+SUB_DOTS = "🟣🔵🟢🟡🟠🔴🟤⚪"                 # one colour per subagent, stable while it runs
+SUB_KIND = {"Explore": "🔎", "Plan": "📐", "general-purpose": "🛠️", "claude-code-guide": "📘",
+            "fork": "🍴", "statusline-setup": "⚙️", "claude": "🛠️"}
+SUB_QUIET_SECS = 120                         # no transcript write for this long -> 💤
+_SHELL_PREFIX_RE = re.compile(r"^(?:(?:cd|source|\.|export|set|ulimit|module)\b[^;&|]*(?:&&|;)\s*)+")
+_CODE_BITS_RE = re.compile(r"[`*_~|]")
+
+
+def sub_action(blk):
+    """What a subagent is doing, said briefly: a Bash call's own description (or its command
+    minus the cd/source/export preamble), a file's name, a search pattern."""
+    name = blk.get("name", "?")
+    inp = blk.get("input") or {}
+    if name == "Bash":
+        if (inp.get("description") or "").strip():
+            return "$ " + _clean(inp["description"], 60)
+        cmd = _SHELL_PREFIX_RE.sub("", " ".join(str(inp.get("command") or "").split()))
+        return "$ " + _clean(cmd, 60)
+    if inp.get("file_path"):
+        return f"{name} {_clean(Path(str(inp['file_path'])).name, 50)}"
+    if name in ("Grep", "Glob") and inp.get("pattern"):
+        return f"{name} {_clean(str(inp['pattern']), 50)}"
+    if name in ("WebFetch",) and inp.get("url"):
+        return f"{name} {_clean(re.sub(r'^https?://', '', str(inp['url'])).split('/')[0], 50)}"
+    _, summ = checkin.tool_summary(blk)
+    return f"{name} {_clean(summ, 55)}"
+
+
+def pretty_model(m):
+    """claude-fable-5-2 -> Fable 5.2; plain aliases (fable) -> Fable."""
+    m = (m or "").removeprefix("claude-")
+    hit = re.match(r"([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-|$)", m)
+    if hit:
+        return f"{hit.group(1).title()} {hit.group(2)}" + (f".{hit.group(3)}" if hit.group(3) else "")
+    return m.title() if m else ""
+
+
+def _sub_dot(a, aid):
+    i = a.get("dot") if isinstance(a.get("dot"), int) else zlib.crc32(str(aid).encode())
+    return SUB_DOTS[i % len(SUB_DOTS)]
+
+
+def _sub_title(text, n=64):
+    return _CODE_BITS_RE.sub("", _clean(text, n))
+
+
 def subagent_lines(subs, transcript=None, now=None, limit=4):
-    """One line per live subagent: type, description, age, tool count, what it is doing now.
-    Returns (lines, done_count)."""
+    """The subagent block: per live subagent a bold headline (its task) and a small grey line
+    (kind · model · background · age · tools · 💤 quiet) plus what it is doing now; then the
+    ones that finished this turn, ticked off. Returns (lines, done_count)."""
     now = now or time.time()
+    subs = subs or {}
     lines = []
-    live = list(((subs or {}).get("live") or {}).items())
+    live = list((subs.get("live") or {}).items())
     for aid, a in live[:limit]:
         if isinstance(a, str):                    # entries written by older bridges
             a = {"type": a}
         prog = subagent_progress(transcript, aid)
         meta = prog.get("meta") or {}
         kind = a.get("type") or meta.get("agentType") or "agent"
-        desc = a.get("desc") or meta.get("description") or ""
-        bits = [kind + (f" — *{_clean(desc, 60)}*" if desc else "")]
+        desc = a.get("desc") or meta.get("description") or kind
+        lines.append(f"{_sub_dot(a, aid)} **{_sub_title(desc)}**")
+        bits = [f"{SUB_KIND.get(kind, '🤖')} {kind}"]
+        model = pretty_model(prog.get("model") or meta.get("model"))
+        if model:
+            bits.append(model)
         if meta.get("requestShape") == "background":
-            bits[0] = "🌙 " + bits[0]
+            bits.append("🌙 background")
         if a.get("at"):
             bits.append(_ago(now - a["at"]))
         if prog.get("tools"):
             bits.append(f"{prog['tools']} tool{'s' if prog['tools'] != 1 else ''}")
+        if prog.get("mtime") and now - prog["mtime"] > SUB_QUIET_SECS:
+            bits.append(f"💤 quiet {_ago(now - prog['mtime'])}")
+        lines.append("-# " + " · ".join(bits))
         if prog.get("last"):
-            bits.append(f"`{prog['last']}`")
-        lines.append(" · ".join(bits)[:230])
+            lines.append(f"-# ↳ `{prog['last']}`")
     if len(live) > limit:
-        lines.append(f"+{len(live) - limit} more")
-    return lines, sum(((subs or {}).get("done") or {}).values())
+        lines.append(f"-# …and {len(live) - limit} more running")
+    done = sum((subs.get("done") or {}).values())
+    finished = subs.get("finished") or []
+    for f in finished[-3:]:
+        prog = subagent_progress(transcript, f.get("aid"))
+        meta = prog.get("meta") or {}
+        desc = f.get("desc") or meta.get("description") or f.get("type") or "agent"
+        bits = [f"✅ {_sub_title(desc, 56)}"]
+        if f.get("at") and f.get("end"):
+            bits.append(_ago(f["end"] - f["at"]))
+        if prog.get("tools"):
+            bits.append(f"{prog['tools']} tool{'s' if prog['tools'] != 1 else ''}")
+        lines.append("-# " + " · ".join(bits))
+    older = done - len(finished[-3:])
+    if older > 0:
+        kinds = ", ".join(f"{t} ×{k}" if k > 1 else t for t, k in (subs.get("done") or {}).items())
+        lines.append(f"-# ✅ +{older} earlier" if finished else f"-# ✅ {kinds}")
+    return lines, done
+
+
+def finish_sub(subs, aid, atype=None, end=None):
+    """Move a subagent from live to done/finished (its SubagentStop, or its transcript showed
+    the final reply while the bridge was down and missed the hook)."""
+    a = subs["live"].pop(aid, atype or "agent")
+    atype = a.get("type", atype) if isinstance(a, dict) else a
+    subs.setdefault("done", {})[atype] = subs["done"].get(atype, 0) + 1
+    if isinstance(a, dict):
+        fin = subs.setdefault("finished", [])
+        fin.append({"aid": aid, "type": atype, "desc": a.get("desc"), "at": a.get("at"),
+                    "end": end or time.time(), "dot": a.get("dot")})
+        del fin[:-12]
+
+
+def subagent_header(n_live, done):
+    if n_live:
+        return f"🧭 **Subagents** · {n_live} running" + (f" · {done} done" if done else "")
+    return f"🧭 **Subagents** · {'all ' if done > 1 else ''}{done} done"
 
 
 def subs_text(subs, now=None, limit=4):
     """Single-line summary (kept for callers that want one line)."""
-    lines, done = subagent_lines(subs, None, now, limit)
-    return " · ".join(lines + ([f"{done} done"] if done else []))
+    live = (subs or {}).get("live") or {}
+    _, done = subagent_lines(subs, None, now, limit)
+    return subagent_header(len(live), done).replace("**", "")
 
 
 INBOX_EMOJI = {"sent": "📨", "queued": "⏳", "read": "👀", "done": "✅", "pulled": "↩️", "stuck": "⚠️"}
@@ -1152,12 +1247,9 @@ def card_text(s, card, final=False, model=None, base=None, info=None):
                      + (f" · {scr['thought_for']}" if scr.get("thought_for") else ""))
     if card.get("thought"):
         lines.append(f"💭 {card['thought']}")
-    if sub_lines:
-        n = info.get("subs_live", 0)
-        lines.append(f"🧭 **{n} subagent{'s' if n != 1 else ''}**" + (f" · {sub_done} done" if sub_done else ""))
-        lines.extend(f"{'└' if i == len(sub_lines) - 1 else '├'} {l}" for i, l in enumerate(sub_lines))
-    elif sub_done:
-        lines.append(f"🧭 {sub_done} subagent{'s' if sub_done != 1 else ''} done")
+    if sub_lines or sub_done:
+        lines.append(subagent_header(info.get("subs_live", 0), sub_done))
+        lines.extend(sub_lines)
     if info.get("inbox"):
         lines.append(info["inbox"])
     if info.get("stalled"):
@@ -2380,17 +2472,20 @@ class Bridge(discord.Client):
             # a new turn starts a new line, but background subagents from the last one are
             # still running: carry them over instead of losing track of them
             carry = dict((subs or {}).get("live") or {})
-            subs = st["subs"] = {"live": carry, "done": {}, "msg": None, "closed": False, "started": time.time()}
+            subs = st["subs"] = {"live": carry, "done": {}, "finished": [], "msg": None, "closed": False,
+                                 "started": time.time(),
+                                 "seq": max((a.get("dot", -1) for a in carry.values() if isinstance(a, dict)),
+                                            default=-1) + 1}
         aid = str(ev.get("agent_id") or ev.get("tool_use_id") or time.time())
         if not ev.get("agent_type") and aid not in subs["live"]:
             return       # Claude Code's own helper agents (no type, never started visibly): not yours
         atype = str(ev.get("agent_type") or "agent")
         if name == "SubagentStart":
-            subs["live"][aid] = {"type": atype, "at": time.time()}
+            seq = subs.get("seq", len(subs["live"]))
+            subs["seq"] = seq + 1
+            subs["live"][aid] = {"type": atype, "at": time.time(), "dot": seq}
         else:
-            a = subs["live"].pop(aid, atype)
-            atype = a.get("type", atype) if isinstance(a, dict) else a
-            subs["done"][atype] = subs["done"].get(atype, 0) + 1
+            finish_sub(subs, aid, atype)
 
     def schedule_subs_render(self, key, s, st):
         if key in self._subs_pending:
@@ -2420,12 +2515,7 @@ class Bridge(discord.Client):
         self.pair_agent_descs(st)
         n = len(subs["live"])
         sub_lines, done = subagent_lines(subs, s.get("transcript"))
-        if n:
-            line = "\n".join([f"-# 🧭 {n} subagent{'s' if n != 1 else ''} still running"
-                              + (f" · {done} done" if done else "")] + [f"-# └ {l}" for l in sub_lines])[:1990]
-        else:
-            kinds = ", ".join(f"{t} ×{k}" if k > 1 else t for t, k in (subs.get("done") or {}).items())
-            line = f"-# 🧭 {done} subagent{'s' if done != 1 else ''} done: {kinds}"[:1990]
+        line = "\n".join([subagent_header(n, done)] + sub_lines)[:1990]
         parent = await self.get_thread(st.get("parent", CHANNEL_ID)) or self.main_channel
         if subs.get("msg"):
             try:
@@ -3074,10 +3164,14 @@ class Bridge(discord.Client):
                 f = base / f"agent-{aid}.jsonl" if base else None
                 started = a.get("at", 0) if isinstance(a, dict) else 0
                 try:
-                    quiet = time.time() - f.stat().st_mtime if f else 0
+                    mtime = f.stat().st_mtime if f else 0
+                    quiet = time.time() - mtime if f else 0
                 except OSError:
-                    quiet = time.time() - started if started else 0
-                if quiet > 1800 and time.time() - started > 1800:
+                    mtime, quiet = 0, time.time() - started if started else 0
+                prog = subagent_progress(s.get("transcript"), aid)
+                if prog.get("ended") and quiet > 15:
+                    finish_sub(subs, aid, end=mtime or None)   # SubagentStop missed (bridge restart)
+                elif quiet > 1800 and time.time() - started > 1800:
                     subs["live"].pop(aid, None)     # its SubagentStop never reached us
             if not st.get("card"):
                 await self.render_subs(key, s, st)
